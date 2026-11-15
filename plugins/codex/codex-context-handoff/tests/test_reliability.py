@@ -927,6 +927,91 @@ class WorkerReviewTests(Base):
         self.call(handoff.workers_done)  # re-runnable
 
 
+def native_blocked_turn(turn):
+    """Codex 0.169's record of a prompt its UserPromptSubmit hook blocked (live QA rollout shape)."""
+    return [
+        event("task_started", turn_id=turn, turn_attribution={"turn_id": turn, "turn_trigger": "user"}),
+        {"type": "response_item", "payload": {"type": "message", "role": "developer",
+                                              "content": [{"type": "input_text", "text": "<skills_instructions>"}]}},
+        {"type": "world_state", "payload": {"full": False}},
+        {"type": "turn_context", "payload": {"turn_id": turn}},
+        event("task_complete", turn_id=turn, last_agent_message=None),
+    ]
+
+
+class BlockedTurnTests(SwitchTests):
+    """A held worker message still gets an empty turn of its own in Codex; only that is not a takeover."""
+
+    def append(self, *rows):
+        with self.transcript.open("a") as stream:
+            stream.writelines(json.dumps(row) + "\n" for row in rows)
+
+    def hold(self, turn="w1", session="session"):
+        payload = {"session_id": session, "turn_id": turn, "cwd": "/w", "prompt": REPORT_TEXT}
+        return handoff.mark_takeover(payload, self.root, "t1")[1]
+
+    def test_the_blocked_turn_shape_has_no_content(self):
+        self.append(*native_blocked_turn("w1"))
+        self.assertEqual(handoff.turns_since(self.transcript, "turn")[1], {"id": "w1", "complete": True, "content": False})
+        self.assertEqual(handoff.old_chat_turns(self.record, self.state), ("pending", True))  # not recorded yet
+        self.assertIn("held", self.hold())
+        self.assertEqual(handoff.held_events(self.state)[0]["turn"], "w1")
+        self.assertEqual(handoff.old_chat_turns(self.record, self.state), ("held", True))
+        # Anything a person or the model adds makes it a takeover, held or not.
+        for extra in (event("token_count", info=usage(50)), event("item_completed", item={"type": "UserMessage"}),
+                      {"type": "response_item", "payload": {"type": "function_call", "call_id": "c"}}):
+            with self.subTest(extra=extra["payload"]["type"]):
+                rows = native_blocked_turn("w1")
+                rows.insert(2, extra)
+                self.transcript.write_text("")
+                self.write_events(self.meta, event("task_started", turn_id="turn"), event("task_complete", turn_id="turn"),
+                                  *rows)
+                self.assertEqual(handoff.old_chat_turns(self.record, self.state)[0], "moved")
+
+    def test_a_held_message_in_the_grace_window_with_its_native_turn_recovers(self):
+        def worker_arrives():
+            rows = native_blocked_turn("w1")
+            self.append(rows[0])          # Codex starts the turn, then runs the prompt hook
+            self.assertIn("held", self.hold("w1"))
+            self.append(*rows[1:])
+            self.term.set(screen=HELD_OLD, turn=6, status="done")
+        self.clock.at(1.2, worker_arrives)
+        self.run_switch()
+        self.assertEqual(self.state.with_suffix(".received").read_text(), "fresh\n")
+        self.assertEqual([a["kind"] for a in self.ledger()["attempts"]], ["request", "switch"])
+        self.assertEqual(len(self.keys), 1)
+
+    def test_an_unexplained_or_answered_turn_is_still_a_takeover(self):
+        def stray():
+            self.append(*native_blocked_turn("x9"))  # an empty turn no held message explains
+            self.term.set(turn=6, status="done")
+        self.clock.at(1.2, stray)
+        with self.assertRaisesRegex(RuntimeError, "A new turn started|changed before /clear"):
+            self.run_switch()
+        self.assertEqual(self.keys, [])
+        shutil.rmtree(self.root / "session")
+        self.setUp()
+        def answered():
+            rows = native_blocked_turn("w2")
+            self.append(rows[0])
+            self.hold("w2")
+            self.append(event("item_completed", item={"type": "AgentMessage", "content": []}), *rows[1:])
+            self.term.set(screen=HELD_OLD, turn=6, status="done")
+        self.clock.at(1.2, answered)
+        with self.assertRaisesRegex(RuntimeError, "A new turn started"):
+            self.run_switch()
+        self.assertEqual(self.keys, [])
+
+    def test_after_clear_a_running_empty_turn_in_the_old_chat_is_a_takeover(self):
+        cache = {}
+        self.assertFalse(handoff.source_moved(self.record, cache, self.state))
+        self.append(native_blocked_turn("w1")[0])
+        self.assertIn("held", self.hold("w1"))
+        self.assertTrue(handoff.source_moved(self.record, cache, self.state))  # held but still running
+        self.append(*native_blocked_turn("w1")[1:])
+        self.assertFalse(handoff.source_moved(self.record, cache, self.state))  # finished and held
+
+
 def own_tests_only(cls):
     """Reuse a test class's fixtures without running its tests a second time."""
     for name in dir(cls):
@@ -1138,6 +1223,9 @@ class CoreReviewClassifierTests(ClassifierTests):
         self.assertTrue((folder / ".goal-restore").exists())
         self.assertFalse((folder / ".restore-unconfirmed").exists())
         self.assertFalse((folder / ".goal-mismatch").exists())
+
+
+own_tests_only(BlockedTurnTests)  # its SwitchTests fixtures, not SwitchTests' tests a second time
 
 
 if __name__ == "__main__":

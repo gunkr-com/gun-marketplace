@@ -20,6 +20,40 @@ STATUS = "\n\n  gpt · ~/work\n  ? for shortcuts"
 FRESH = "  >_ OpenAI Codex (v0.167.2)\n\n" + PLACEHOLDER + STATUS
 
 
+def append_rows(transcript, rows):
+    if transcript:
+        with open(transcript, "a", encoding="utf-8") as stream:
+            stream.writelines(json.dumps(row) + "\n" for row in rows)
+
+
+def event(kind, **fields):
+    return {"type": "event_msg", "payload": {"type": kind, **fields}}
+
+
+def started(turn):
+    return [event("task_started", turn_id=turn, turn_attribution={"turn_id": turn, "turn_trigger": "user"})]
+
+
+def blocked_rest(turn):
+    """What Codex 0.169 records for a prompt its UserPromptSubmit hook blocked: context, no content."""
+    return [
+        {"type": "response_item", "payload": {"type": "message", "role": "developer",
+                                              "content": [{"type": "input_text", "text": "<skills_instructions>"}]}},
+        {"type": "world_state", "payload": {"full": False}},
+        {"type": "turn_context", "payload": {"turn_id": turn}},
+        event("task_complete", turn_id=turn, last_agent_message=None),
+    ]
+
+
+def answered_rest(turn, text):
+    return [
+        event("item_completed", item={"type": "UserMessage", "id": turn, "content": [{"type": "text", "text": text}]}),
+        event("item_completed", item={"type": "AgentMessage", "id": f"a{turn}",
+                                      "content": [{"type": "Text", "text": "ok"}]}),
+        event("task_complete", turn_id=turn, last_agent_message="ok"),
+    ]
+
+
 def screen_with(history, text, reply):
     body = history.split("\n" + PLACEHOLDER)[0]
     first = text.splitlines()[0][:60] if text else ""
@@ -59,10 +93,19 @@ def main():
                 out, code = None, 0
                 context = {key: world[key] for key in ("session", "transcripts", "cwd", "hook_env", "script")}
                 context["call"] = len(world["calls"])
+                context["turn"] = f"u{context['call']}"
+                # Codex starts the turn before its UserPromptSubmit hook runs.
+                append_rows(world["transcripts"].get(world["session"]), started(context["turn"]))
+                codex["status"] = {"app": "codex", "state": "working"}
     if out is None:
         result, run = run_hook(context, args[-1])
         with World() as world:
             world["hook_runs"].append(run)
+            transcript = context["transcripts"].get(context["session"])
+            if result.get("decision") == "block":
+                append_rows(transcript, blocked_rest(context["turn"]))
+            else:
+                append_rows(transcript, answered_rest(context["turn"], args[-1]))
             out, code = apply_send(world, args[-1], result), 0
     print(json.dumps(out))
     return code
@@ -70,7 +113,7 @@ def main():
 
 def run_hook(context, prompt):
     session = context["session"]
-    payload = {"hook_event_name": "UserPromptSubmit", "session_id": session, "turn_id": f"u{context['call']}",
+    payload = {"hook_event_name": "UserPromptSubmit", "session_id": session, "turn_id": context["turn"],
                "cwd": context["cwd"], "prompt": prompt, "transcript_path": context["transcripts"].get(session, "")}
     env = dict(os.environ, **context["hook_env"])
     done = subprocess.run([sys.executable, context["script"]], input=json.dumps(payload), capture_output=True,
@@ -84,12 +127,16 @@ def run_hook(context, prompt):
 
 def apply_send(world, text, result):
     codex = world["terminals"][world["codex"]]
-    if result.get("decision") == "block":
-        world["screen"] = screen_with(world["screen"], text, result.get("reason", "blocked"))
-        return {"started": False, "status": "idle", "turn": codex["turn"]}
-    world["screen"] = screen_with(world["screen"], text, "ok")
+    # Herdr's turn goes up when the status leaves working, also for the blocked prompt's empty turn,
+    # after which Codex reports done.
     codex["turn"] += 1
     codex["status_ms"] = int(time.time() * 1000)
+    if result.get("decision") == "block":
+        codex["status"] = {"app": "codex", "state": "done"}
+        world["screen"] = screen_with(world["screen"], text, result.get("reason", "blocked"))
+        return {"started": True, "status": "idle", "turn": codex["turn"]}
+    codex["status"] = {"app": "codex", "state": "idle"}
+    world["screen"] = screen_with(world["screen"], text, "ok")
     world["accepted"].append({"session": world["session"], "prompt": text})
     return {"started": True, "status": "idle", "turn": codex["turn"]}
 

@@ -2423,6 +2423,64 @@ def held_seen(state):
     return len(held_events(state))
 
 
+QUIET_EVENTS = {"task_started", "task_complete", "turn_aborted", "thread_settings_applied"}
+
+
+def turns_since(transcript, turn_id):
+    """The chat's turns from `turn_id` on, oldest first: {id, complete, content}, or None when that turn
+    is not in the transcript. `content` is anything a person or the model added: a user or agent message,
+    reasoning, a tool call, a model request (token count), a final answer. A prompt that a
+    UserPromptSubmit hook blocked still gets a turn of its own in Codex (seen with 0.169): task_started,
+    developer context, then task_complete with no message, and nothing else."""
+    tail = TRANSCRIPT_TAIL
+    while True:
+        turns, current, seen = [], None, False
+        for row_type, item in transcript_rows(transcript, tail, (b'"event_msg"', b'"response_item"')):
+            kind = item.get("type")
+            if row_type == "event_msg" and kind == "task_started":
+                current = {"id": item.get("turn_id"), "complete": False, "content": False}
+                if current["id"] == turn_id:
+                    seen, turns = True, []
+                if seen:
+                    turns.append(current)
+                continue
+            if current is None:
+                continue
+            if row_type == "event_msg" and kind in {"task_complete", "turn_aborted"}:
+                if item.get("turn_id") == current["id"]:
+                    current["complete"] = True
+                    current["content"] = current["content"] or bool(item.get("last_agent_message"))
+            elif row_type == "event_msg" and kind not in QUIET_EVENTS:
+                current["content"] = True
+            elif row_type == "response_item" and not (kind == "message" and item.get("role") == "developer"):
+                current["content"] = True
+        if seen or tail >= os.path.getsize(transcript):
+            return turns if seen else None
+        tail *= 4
+
+
+def old_chat_turns(record, state):
+    """(verdict, the handoff turn finished) for the original chat.
+
+    `same`: no turn after the handoff's. `held`: every later turn is one whose prompt this plugin held
+    (its turn id is in the held log, for this chat) and has no content, and all have finished; those are
+    not a takeover. `pending`: a later turn without content that is still running or not yet in the held
+    log (the prompt hook records it while the turn runs). `moved`: anything else, a real takeover.
+    """
+    turns = turns_since(record["transcript"], record["turn"])
+    if not turns:
+        return "moved", False
+    later = turns[1:]
+    if not later:
+        return "same", turns[0]["complete"]
+    held = {e.get("turn") for e in held_events(state) if e.get("session") == record["session"] and e.get("turn")}
+    if any(turn["content"] for turn in later):
+        return "moved", turns[0]["complete"]
+    if all(turn["id"] in held and turn["complete"] for turn in later):
+        return "held", turns[0]["complete"]
+    return "pending", turns[0]["complete"]
+
+
 def may_be_held(problem):
     """Whether a fresh-chat problem could be the trace of a worker message the prompt hook is holding
     (a short busy period, a new prompt line, another Herdr turn); drafts, dialogs, cancellations and
@@ -2452,16 +2510,23 @@ def settle_change(state, record, held_base, phase, final):
 def await_old_chat(record, state, start_turn, held_base, wait=12.0):
     """Return (screen, Herdr turn) once the finished turn's chat shows an empty, idle prompt."""
     deadline = time.monotonic() + wait
-    previous = None
+    previous = pending_since = None
     while time.monotonic() < deadline:
         if stopped(state):
             raise RuntimeError("Handoff was cancelled before /clear.")
-        turn = recent_turn(record["transcript"])
+        verdict, finished = old_chat_turns(record, state)
+        turn = {"complete": finished and verdict in {"same", "held"}}
         info = terminal_info(record["terminal"], record["cwd"], record["pid"])
         if not info:
             raise RuntimeError("The terminal no longer runs the original Codex in this worktree.")
-        if not turn or turn["id"] != record["turn"]:
+        if verdict == "moved":
             raise RuntimeError("A new turn started in the original chat before /clear.")
+        if verdict == "pending":
+            pending_since = pending_since or time.monotonic()
+            if time.monotonic() - pending_since > INPUT_SETTLE + 3.0:
+                raise RuntimeError("A new turn started in the original chat before /clear.")
+        else:
+            pending_since = None
         status = active_status(info)
         if status in {"blocked", "error"}:
             raise RuntimeError(f"The original chat reported {status}; check the terminal.")
@@ -2519,13 +2584,20 @@ def describe(view, old_screen, history_ok=False):
     return f"status {view[0]}, Herdr turn {view[1]}, prompt {prompt_state(view[3], old_screen, history_ok)}"
 
 
-def source_moved(record, cache):
-    """Whether the old chat's transcript shows another turn (re-read only when the file changes)."""
+def source_moved(record, cache, state=None):
+    """Whether the old chat's transcript shows another turn that is not a held worker message's empty
+    turn (re-read only when the file changes)."""
     stat = os.stat(record["transcript"])
-    signature = (stat.st_size, stat.st_mtime_ns)
+    signature = (stat.st_size, stat.st_mtime_ns, held_seen(state) if state else 0)
     if cache.get("signature") != signature:
-        latest = recent_turn(record["transcript"])
-        cache.update(signature=signature, moved=not latest or latest["id"] != record["turn"])
+        if state is None:
+            latest = recent_turn(record["transcript"])
+            moved = not latest or latest["id"] != record["turn"]
+        else:
+            # After /clear the old chat may not move at all: only finished, held, empty turns are allowed;
+            # a running or unrecorded empty turn is a takeover too.
+            moved = old_chat_turns(record, state)[0] not in {"same", "held"}
+        cache.update(signature=signature, moved=moved)
     return cache["moved"]
 
 
@@ -2545,7 +2617,7 @@ def fresh_chat_problem(view, state, record, old_screen, cleared_turn, echo, cach
     changed = goal_changed(record)
     if changed:
         return f"Stopped: {changed}"
-    if source_moved(record, cache):
+    if source_moved(record, cache, state):
         return "The old chat started another turn"
     if view is None:
         return "The terminal no longer runs the original Codex in this worktree"
@@ -2564,7 +2636,8 @@ def fresh_chat_problem(view, state, record, old_screen, cleared_turn, echo, cach
         draft = composer_text(screen) if screen is not None else None
         if shown in {"old screen", "blank"} or (draft and "/clear".startswith(draft)):
             return None
-    elif status not in {"working", "idle"}:
+    elif status not in {"working", "idle"} and not (history_ok and status == "done"):
+        # After a held worker message Codex ends that empty turn and reports done, not idle.
         return f"The fresh chat reported {status}"
     elif shown == "fresh":
         return None
@@ -2606,7 +2679,7 @@ def await_fresh_chat(record, state, old_screen, cleared_turn, cache, rebased=Fal
             if not may_be_held(problem):
                 raise RuntimeError(message)
             settle_change(state, record, held_base, "post-clear", message)
-        if view[0] == "idle" and fresh:
+        if (view[0] == "idle" or (history_ok and view[0] == "done")) and fresh:
             if settled is None or settled[0] != view[1:]:
                 settled = (view[1:], now)
             elif now - settled[1] >= SETTLE:
@@ -2845,7 +2918,8 @@ def reconcile_receipt(record, state, old_screen, send_turn, typed_at, history_ok
         )
     if receipt.is_file():
         return True
-    if status == "idle" and not draft and prompt_state(screen, old_screen, history_ok) == "fresh":
+    if (status == "idle" or (history_ok and status == "done")) and not draft and prompt_state(
+            screen, old_screen, history_ok) == "fresh":
         update_ledger(state, lambda data: data["sends"][-1].update(delivery_absent=True) if data["sends"] else None)
         raise Retryable(
             "The continuation did not arrive (empty prompt, Herdr turn unchanged, no transcript has it).", "post-clear"
@@ -2957,8 +3031,7 @@ def announce_failure(state, record):
         return skip("the composer is not empty or the screen is unreadable")
     turn = info.get("turn")
     if clear.get("typed_at") is None:
-        latest = recent_turn(record["transcript"])
-        if not latest or latest["id"] != record["turn"]:
+        if old_chat_turns(record, state)[0] not in {"same", "held"}:
             return skip("the original chat moved on")
         rows = rows_after(record["transcript"], record.get("offset"))
         if rows is None or user_input(rows, record.get("prompt"), input_counter(state, record)):
@@ -3084,8 +3157,7 @@ def pre_clear(record, state, context):
     set_stage(state, "old-idle")
     log(f"old chat idle at Herdr turn {turn}; holding {grace():g}s for cancellation")
     hold_for_cancel(record, state, screen, grace(), turn, held_base)
-    latest = recent_turn(record["transcript"])
-    if not latest or latest["id"] != record["turn"]:
+    if old_chat_turns(record, state)[0] not in {"same", "held"}:
         raise RuntimeError("A new turn started before /clear.")
     hold_for_cancel(record, state, screen, 0, turn, held_base)  # final recheck immediately before /clear
     set_stage(state, "grace-held")
@@ -3130,7 +3202,8 @@ def post_clear(record, state, context):
     problem = fresh_chat_problem(view, state, record, old_screen, cleared_turn, False, cache, history_ok)
     if problem and not may_be_held(problem):
         raise RuntimeError(f"{problem} just before the continuation ({describe(view, old_screen, history_ok)}).")
-    if problem or view[0] != "idle" or view[1:] != settled:
+    ready = view is not None and (view[0] == "idle" or (history_ok and view[0] == "done"))
+    if problem or not ready or view[1:] != settled:
         settle_change(state, record, held_base, "post-clear", (
             f"{problem or 'The fresh chat changed'} just before the continuation "
             f"({describe(view, old_screen, history_ok)})."
@@ -3140,7 +3213,10 @@ def post_clear(record, state, context):
         {"intent_at": time.time(), "turn": send_turn}
     )))
     try:
-        sent = hc("send", "--json", "--if", "idle", record["terminal"], continuation(record, state))
+        # `--if idle` lets Herdr refuse atomically; a fresh chat that ended a held message's empty turn
+        # reports done instead, checked just above.
+        guard = ["--if", "idle"] if view[0] == "idle" else []
+        sent = hc("send", "--json", *guard, record["terminal"], continuation(record, state))
     except (subprocess.SubprocessError, ValueError, OSError) as error:
         sent = {"error": f"{type(error).__name__}: {error}"}
     log(f"continuation sent: {json.dumps(sent)}")
@@ -3180,8 +3256,8 @@ def hold_worker_message(state, record, payload, prompt, terminal):
         same = next((entry for entry in entries if entry.get("key") == key), None)
         with open(state.with_suffix(".held-events.jsonl"), "a", encoding="utf-8") as stream:
             os.chmod(stream.name, 0o600)  # every delivery, so a repeat still explains a changed screen
-            stream.write(json.dumps({"at": utc_now(), "session": session, "key": key,
-                                     "repeat": bool(same)}) + "\n")
+            stream.write(json.dumps({"at": utc_now(), "session": session, "turn": payload.get("turn_id"),
+                                     "key": key, "repeat": bool(same)}) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
         if same:
@@ -3189,7 +3265,8 @@ def hold_worker_message(state, record, payload, prompt, terminal):
         else:
             revision = len(entries) + 1
             entry = {
-                "revision": revision, "key": key, "at": utc_now(), "session": session, "from": verdict["sender"],
+                "revision": revision, "key": key, "at": utc_now(), "session": session,
+                "turn": payload.get("turn_id"), "from": verdict["sender"],
                 "kind": verdict["kind"], "why": verdict["why"], "sha256": digest(prompt), "text": prompt,
             }
             with open(state.with_suffix(".held.jsonl"), "a", encoding="utf-8") as stream:

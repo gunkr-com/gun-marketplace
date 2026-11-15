@@ -175,7 +175,7 @@ class EndToEndTests(unittest.TestCase):
     def test_a_worker_message_in_the_grace_window_is_held_and_the_switch_recovers(self):
         self.capture()
         self.wait_for(lambda: "old-idle" in self.ledger().get("stages", {}))
-        self.assertFalse(self.herdr_send(WORKER)["started"])  # blocked by the plugin's hook
+        self.herdr_send(WORKER)  # blocked by the plugin's hook (Codex still records an empty turn)
         self.wait_for(self.finished)
         self.assertEqual(self.state.with_suffix(".received").read_text(), "fresh\n", self.log())
         attempts = self.ledger()["attempts"]
@@ -184,18 +184,28 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(sum(1 for call in world["calls"] if call[0] == "keys"), 1)
         self.assertEqual([a["session"] for a in world["accepted"]], ["fresh"])  # the worker text reached no chat
         self.assertIn("## Held worker message 1 (from t2", self.state.with_suffix(".md").read_text())
+        # Codex recorded an empty turn for the blocked prompt in the old chat, as it does natively.
+        rows = [json.loads(line) for line in Path(self.transcripts["src"]).read_text().splitlines()]
+        held_turn = json.loads(self.state.with_suffix(".held.jsonl").read_text().splitlines()[0])["turn"]
+        self.assertIn({"type": "task_complete", "turn_id": held_turn, "last_agent_message": None},
+                      [row["payload"] for row in rows if row["type"] == "event_msg"])
         self.assert_only_fake_herdr()
 
     def test_a_worker_message_after_clear_is_held_without_a_second_clear(self):
         self.capture()
         self.wait_for(lambda: "cleared" in self.ledger().get("stages", {}))
-        self.assertFalse(self.herdr_send(WORKER)["started"])
+        self.herdr_send(WORKER)
         self.wait_for(self.finished)
         self.assertEqual(self.state.with_suffix(".received").read_text(), "fresh\n", self.log())
         world = self.world()
         self.assertEqual(sum(1 for call in world["calls"] if call[0] == "keys"), 1)
         held = [json.loads(line) for line in self.state.with_suffix(".held.jsonl").read_text().splitlines()]
         self.assertEqual(held[0]["session"], "fresh")
+        # The fresh chat reported done after the held message's empty turn, so the continuation went
+        # without `--if idle` after the switch checked the empty composer itself.
+        sends = [call for call in world["calls"] if call[0] == "send" and "Codex Context Handoff:" in call[-1]]
+        self.assertEqual(len(sends), 1)
+        self.assertNotIn("--if", sends[0])
         self.assert_only_fake_herdr()
 
     def test_a_person_in_the_grace_window_wins_and_nothing_is_retried(self):
