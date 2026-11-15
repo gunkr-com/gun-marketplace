@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Rotate an opted-in Codex CLI chat without replacing its Herdr terminal."""
 
+import calendar
 import fcntl
 import hashlib
 import json
@@ -21,6 +22,26 @@ TERMINAL = re.compile(r"t[0-9a-z]+\Z")
 RESUME = re.compile(r"Codex Context Handoff: ([\w-]+) ([\w-]+) ([0-9a-f]{24})(?![0-9a-f])")
 COMPOSER = re.compile(r"^›(?:\s+Ask Codex to do anything)?\s*$")
 PLACEHOLDER = "› Ask Codex to do anything"
+FOOTER = 4  # the prompt sits within the last 4 lines: prompt, blank, two status lines
+WRAPPED_FOOTER = 8  # with the placeholder shown, a narrow terminal may wrap the status lines
+DIALOG = ("›", "•", "╭", "│", "╰", "┌", "└", "esc to cancel")  # lines that are never part of the status
+# A Herdr message is the whole prompt, typed by herdr-core: `<hc from="t7[ name]"[ reach="..."]>body</hc>`.
+ENVELOPE = re.compile(r'\A<hc from="(t[0-9a-z]+)(?: ([^"\n]+))?"(?: reach="[^"\n]*")?>([\s\S]*)</hc>\Z')
+# herdr-core's own notes to a direct parent about a child: exited, blocked, or hit an error.
+CHILD_NOTE = re.compile(
+    r"\A<hc>(t[0-9a-z]+)(?: ([^\n]+?))? (?:exited \((?:exit -?\d+|signal \d+)\)\.(?: Read: hc read \1"
+    r"| Last lines:\n[\s\S]*\nRead: hc read \1)|is blocked \([^)\n]+\)\. See: hc read \1"
+    r"|hit an error: [\s\S]*\. See: hc read \1)</hc>\Z"
+)
+WORKER_KINDS = {"worker", "worker-note"}
+MAX_LINEAGE = 16
+BUDGET = 3  # end-to-end attempts per handoff: the first request, then each note re-prompt or switch retry
+RECEIPT_WAIT = 12.0
+RECONCILE_WAIT = 20.0
+RETRY_IDLE_WAIT = 60.0  # how long a retry waits for the next idle boundary
+INPUT_SETTLE = 2.0  # how long a screen change may wait for its UserPromptSubmit hook to record it
+HELD_IN_NOTE = 4000  # characters of each held worker message copied into the note (all of it is kept aside)
+GOAL_WORKER_POLICY = "goal-worker-input.json"
 TRANSCRIPT_TAIL = 4 * 1024 * 1024
 MAX_NOTE = 12_000
 POLL = 0.2
@@ -190,11 +211,184 @@ def exceeds_threshold(usage, threshold):
     )
 
 
-def hc(*args):
+def hc(*args, timeout=8):
     result = subprocess.run(
-        ["hc", *args], check=True, capture_output=True, text=True, timeout=8, env=HC_ENV
+        ["hc", *args], check=True, capture_output=True, text=True, timeout=timeout, env=HC_ENV
     )
     return json.loads(result.stdout)
+
+
+def hc_list(timeout=3):
+    """One bulk Herdr snapshot, live and finished terminals: {address: terminal}."""
+    result = subprocess.run(
+        ["hc", "ls", "--json", "--all"], check=True, capture_output=True, text=True, timeout=timeout, env=HC_ENV
+    )
+    data = json.loads(result.stdout)
+    entries = data.get("terminals", []) if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        raise ValueError("unexpected hc ls output")
+    return {e["address"]: e for e in entries if isinstance(e, dict) and isinstance(e.get("address"), str)}
+
+
+class Snapshot:
+    """A Herdr snapshot taken at most once per hook run, and only when needed; None if hc fails."""
+
+    def __init__(self, timeout=3):
+        self.timeout, self.taken, self.value, self.error = timeout, False, None, None
+
+    def get(self):
+        if not self.taken:
+            self.taken = True
+            try:
+                self.value = hc_list(self.timeout)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                self.error = f"{type(error).__name__}: {error}"
+        return self.value
+
+
+def lineage(snapshot, address, root):
+    """The chain from `address` up to `root` (root excluded) when `root` is an ancestor, else None."""
+    chain, current = [], address
+    while current not in chain and len(chain) < MAX_LINEAGE:
+        entry = snapshot.get(current)
+        if not isinstance(entry, dict):
+            return None
+        chain.append(current)
+        parent = entry.get("parent")
+        if parent == root:
+            return chain
+        if not isinstance(parent, str) or not parent:
+            return None
+        current = parent
+    return None
+
+
+def classify_input(text, terminal, snapshot, known=None):
+    """(kind, sender, why) for one submitted message.
+
+    Herdr types its messages into the terminal like a person would, and Codex records them as user
+    input with no sender metadata. The evidence available is the envelope herdr-core writes around the
+    whole message and its own record of which terminal started which (`parent`, set once at start).
+    `worker`: an `<hc from=...>` message from a strict descendant of this terminal; `worker-note`:
+    herdr-core's own note about a direct child in a state that fits the note (or, for a child removed
+    since, its entry in this handoff's manifest). `parent` and `foreign` senders give directions, so
+    they count as user input, like `human` (no envelope) and `unverified` (malformed, mixed with other
+    text, or not checkable). `known` maps manifest addresses to their recorded entries.
+    """
+    text = (text or "").strip()
+    if not text.startswith("<hc"):
+        return "human", None, "no Herdr envelope"
+    envelope = ENVELOPE.fullmatch(text)
+    note = None if envelope else CHILD_NOTE.fullmatch(text)
+    if not envelope and not note:
+        return "unverified", None, "not exactly one Herdr message"
+    found = envelope or note
+    sender, name = found.group(1), found.group(2)
+    if envelope and ("<hc from=" in envelope.group(3) or "<hc>" in envelope.group(3)):
+        return "unverified", sender, "more than one Herdr message"
+    if not TERMINAL.fullmatch(terminal or "") or sender == terminal:
+        return "unverified", sender, "not checkable from this terminal"
+    terminals = snapshot.get()
+    if terminals is None:
+        return "unverified", sender, f"Herdr could not be read ({snapshot.error})"
+    entry = terminals.get(sender)
+    if entry is None and note:
+        entry = (known or {}).get(sender)
+        if not isinstance(entry, dict):
+            return "unverified", sender, "Herdr does not know the sender"
+        source = "this handoff's worker manifest"
+    elif entry is None:
+        return "unverified", sender, "Herdr does not know the sender"
+    else:
+        source = "Herdr"
+    if name is not None and entry.get("name") != name:
+        return "unverified", sender, f"the sender's name does not match {source}"
+    if note:
+        if entry.get("parent") != terminal:
+            return "unverified", sender, "Herdr notes come only from direct children"
+        exited = " exited (" in text.split(">", 1)[1].split("\n", 1)[0]
+        state = entry.get("state")
+        if source == "Herdr" and exited and state != "finished":
+            return "unverified", sender, "an exit note for a terminal Herdr shows running"
+        if source == "Herdr" and not exited and state != "live":
+            return "unverified", sender, "a blocked or error note for a terminal that has finished"
+        if source != "Herdr" and not exited:
+            return "unverified", sender, "only an exit note can come from a removed child"
+        return "worker-note", sender, f"Herdr's note about a direct child ({source})"
+    chain = lineage(terminals, sender, terminal)
+    if chain:
+        return "worker", sender, "descendant " + " < ".join([*chain, terminal])
+    if lineage(terminals, terminal, sender):
+        return "parent", sender, "an ancestor of this terminal"
+    return "foreign", sender, "not started from this terminal"
+
+
+class InputJudge:
+    """Classifies the user-role messages of one handoff; verdicts are kept in `<state>.inputs.json`.
+
+    Envelope verdicts are cached by text digest, so the gate asks Herdr at most once per new message
+    and a sender removed later cannot change a verdict. A verdict reached while Herdr could not be read
+    is not cached (it is `unverified`, which counts as user input, so the attempt is settled anyway).
+    """
+
+    def __init__(self, state, terminal):
+        self.state, self.terminal, self.snapshot = state, terminal, Snapshot()
+        self.path = state.with_suffix(".inputs.json") if state else None
+        self.cache = (read_json(self.path) if self.path else None) or {}
+
+    def verdict(self, text):
+        text = (text or "").strip()
+        if not text.startswith("<hc"):
+            return {"kind": "human", "sender": None, "why": "no Herdr envelope"}
+        key = digest(text)
+        hit = self.cache.get(key)
+        if isinstance(hit, dict) and isinstance(hit.get("kind"), str):
+            return hit
+        kind, sender, why = classify_input(text, self.terminal, self.snapshot, manifest_entries(self.state))
+        verdict = {"kind": kind, "sender": sender, "why": why, "at": utc_now()}
+        if self.path and self.snapshot.error is None:
+            self.cache[key] = verdict
+            try:
+                with open_lock(self.state.with_suffix(".inputs-lock")):
+                    stored = read_json(self.path) or {}
+                    stored[key] = verdict
+                    replace_private(self.path, json.dumps(stored))
+            except OSError:
+                pass
+        return verdict
+
+    def kind(self, text):
+        return self.verdict(text)["kind"]
+
+
+def manifest_entries(state):
+    """{address: recorded entry} from this handoff's worker manifest (empty when there is none)."""
+    data = read_json(state.with_suffix(".workers.json")) if state else None
+    workers = data.get("workers") if data else None
+    if not isinstance(workers, list):
+        return {}
+    return {w["address"]: w for w in workers if isinstance(w, dict) and isinstance(w.get("address"), str)}
+
+
+def goal_worker_policy(root):
+    """`exempt` once the user said verified worker messages may not put off a Goal transfer; `intervene`
+    (the default, matching the standing instruction that worker messages count as intervening input)."""
+    data = read_json(root / GOAL_WORKER_POLICY)
+    return "exempt" if data and data.get("policy") == "exempt" else "intervene"
+
+
+def input_counter(state, record, paused=False):
+    """A function telling whether a user-role message after the arm counts as input against it.
+
+    Verified worker messages never count for a handoff without a Goal transfer, nor after the
+    transferred Goal was paused; before the pause they count unless the Goal worker policy is exempt.
+    """
+    judge = InputJudge(state, record.get("terminal", ""))
+    exempt = not goal_moves(record) or paused or goal_worker_policy(state.parent.parent) == "exempt"
+
+    def counts(text):
+        return not (exempt and judge.kind(text) in WORKER_KINDS)
+    return counts
 
 
 def same_cwd(left, right):
@@ -455,31 +649,64 @@ def message_text(content):
     ) if isinstance(content, list) else ""
 
 
-def user_input(rows, exempt=None):
+def user_input(rows, exempt=None, counts=None):
     """Whether the user acted after our request: a prompt or steer (UserMessage), a /goal change
     (a user-role <codex_internal_context source="user_goal">), or any other user-role message that is
     not a hook prompt Codex itself recorded (paired with a HookPrompt event of the same id).
 
     `exempt` is the exact prompt that armed the handoff (`handoff now`), which is not an objection to it.
+    `counts(text)` may rule a message out (a verified Herdr worker message, see `input_counter`).
     """
-    def armed_it(content):
-        return exempt is not None and " ".join(message_text(content).split()) == exempt
+    def objects(content):
+        if exempt is not None and " ".join(message_text(content).split()) == exempt:
+            return False
+        return counts is None or counts(message_text(content))
 
     hooks = set()
     for row_type, item in rows:
         if row_type == "event_msg" and item.get("type") == "item_completed" and isinstance(item.get("item"), dict):
-            if item["item"].get("type") == "UserMessage" and not armed_it(item["item"].get("content")):
+            if item["item"].get("type") == "UserMessage" and objects(item["item"].get("content")):
                 return True
             if item["item"].get("type") == "HookPrompt":
                 hooks.add(item["item"].get("id"))
     return any(
         row_type == "response_item" and item.get("type") == "message" and item.get("role") == "user"
-        and not armed_it(item.get("content"))
         and not (item.get("id") in hooks and all(
             isinstance(part, dict) and str(part.get("text", "")).startswith("<hook_prompt")
             for part in item.get("content") or ()
         ))
+        and objects(item.get("content"))
         for row_type, item in rows
+    )
+
+
+def pause_index(rows):
+    """The index just past the first tool output that printed the Goal paused by `update_goal paused`
+    (len(rows) when there is none): input before it may put a transfer off, input after it may not."""
+    calls = {}
+    for index, (row_type, item) in enumerate(rows):
+        if row_type != "response_item":
+            continue
+        kind, call = item.get("type"), item.get("call_id")
+        if kind == "custom_tool_call" and item.get("name") == "exec":
+            code = str(item.get("input") or "")
+            calls[call] = "tools.update_goal" in code and "paused" in code
+        elif kind == "function_call" and item.get("name") == "update_goal":
+            calls[call] = "paused" in str(item.get("arguments") or "")
+        elif kind in {"custom_tool_call_output", "function_call_output"} and calls.get(call):
+            if any(goal.get("status") == "paused" for goal in output_goals(item.get("output"))):
+                return index + 1
+    return len(rows)
+
+
+def objected(rows, record, state):
+    """Whether input after the arm stands against this handoff (see `input_counter`)."""
+    prompt = record.get("prompt")
+    if not goal_moves(record):
+        return user_input(rows, prompt, input_counter(state, record))
+    cut = pause_index(rows)
+    return user_input(rows[:cut], prompt, input_counter(state, record)) or user_input(
+        rows[cut:], prompt, input_counter(state, record, paused=True)
     )
 
 
@@ -608,7 +835,7 @@ def verify_transfer(record, state):
     rows = armed_rows(record)
     if rows is None:
         return None, "the handoff request was not found in the transcript"
-    if user_input(rows, record.get("prompt")):
+    if objected(rows, record, state):
         return None, "user input arrived during the handoff turn"
     # Exactly the one pause asked for: no second update, no create, so nothing changed after it.
     if goal_calls(rows) != (1, 0):
@@ -794,14 +1021,36 @@ def pending_restore(folder):
     return path, expected
 
 
-def cancel_restore(payload, root):
-    """Any prompt after the continuation ends the restore check, so no reminder lands in a new task."""
+def received_worker_message(payload, root, terminal, judges=None):
+    """Whether the prompt is a verified worker message, judged with the received handoff's manifest (a
+    removed child's exit note) and one Herdr snapshot shared by the whole hook run (`judges`)."""
+    prompt = (payload.get("prompt") or "").strip()
+    session = payload.get("session_id") or ""
+    if not prompt.startswith("<hc") or not ID.fullmatch(session):
+        return False
+    judges = {} if judges is None else judges
+    if "judge" not in judges:
+        state, _ = received_handoff(root / session, root)
+        judges["judge"] = InputJudge(state, terminal)
+    return judges["judge"].kind(prompt) in WORKER_KINDS
+
+
+def is_control(payload):
+    return bool(CONTROLS.get(" ".join((payload.get("prompt") or "").split()).lower()))
+
+
+def cancel_restore(payload, root, terminal="", judges=None):
+    """Any prompt after the continuation ends the restore check, so no reminder lands in a new task.
+    A verified Herdr worker message is not the user's next task, and a `handoff` control never reaches
+    the model, so both leave the check pending."""
     session = payload.get("session_id") or ""
     if not ID.fullmatch(session):
         return None
     folder = root / session
     path, expected = pending_restore(folder)
     if path is None:
+        return None
+    if is_control(payload) or received_worker_message(payload, root, terminal, judges):
         return None
     if expected and payload.get("transcript_path"):
         status, row = goal_state(payload["transcript_path"], session)
@@ -964,6 +1213,7 @@ def arm_record(payload, root, terminal, info, goal, origin, used, prompt=None):
         if latch:
             (folder / ".goal-requested").unlink(missing_ok=True)  # ours: never leave a latch without a record
         return None
+    set_stage(state, "armed", origin=origin)
     return record
 
 
@@ -1070,7 +1320,7 @@ def gate_hook(payload, root, terminal):
     used = usage_percent(latest["usage"])
     notice = settle_orphans(folder, turn)
     shown = {"systemMessage": notice} if notice else {}
-    if pending(folder) or not confirm_restore(folder, transcript, session):
+    if pending(folder) or not confirm_restore(folder, transcript, session) or failed_recently(folder, used):
         return shown
     status, row = goal_state(transcript, session, latest.get("trigger"))
     if status == "none":
@@ -1131,7 +1381,7 @@ def gate_decision(payload, state, record):
     """
     gate = read_json(state.with_suffix(".gate")) or {"checkpoint": 0, "denied": 0, "updated": None}
     rows = rows_after(record["transcript"], record["offset"])
-    if rows is None or user_input(rows, record.get("prompt")):
+    if rows is None or objected(rows, record, state):
         # The user (or a worker message) spoke after the arm: their request wins. Settle the attempt now,
         # since an interrupted turn may never reach Stop.
         return settle(state, record, "user input arrived before the Goal was paused" if goal_moves(record)
@@ -1351,15 +1601,16 @@ def put_off(state, record, why):
     )}
 
 
-def user_spoke(record):
-    """Whether a prompt, steer or worker message arrived after the arm (the arming prompt excepted)."""
+def user_spoke(record, state):
+    """Whether a prompt, steer, or a Herdr message that counts as input arrived after the arm (the arming
+    prompt excepted; see `input_counter` for worker messages)."""
     rows = armed_rows(record)
-    return rows is not None and user_input(rows, record.get("prompt"))
+    return rows is not None and objected(rows, record, state)
 
 
 def user_put_off(state, record):
     """The user spoke after the arm and the Goal was never touched: put the attempt off, not fail it."""
-    return user_spoke(record) and untouched(state, record)
+    return user_spoke(record, state) and untouched(state, record)
 
 
 def untouched(state, record):
@@ -1405,6 +1656,7 @@ def arm_now(payload, root, terminal, prompt=None):
     settle_orphans(folder, turn)
     if pending(folder):
         return None, "a handoff is already pending in this chat"
+    (folder / ".switch-failed").unlink(missing_ok=True)  # an explicit request is a new attempt
     status, row = goal_state(transcript, session)
     goal = None
     if status == "unknown":
@@ -1446,7 +1698,7 @@ def find_transcript(session):
 
 
 def user_asked(transcript, turn):
-    """Whether a user message (not this plugin's continuation) arrived in the given turn."""
+    """Whether a user message (not this plugin's continuation, not a Herdr message) arrived in the given turn."""
     tail = TRANSCRIPT_TAIL
     while True:
         started = asked = False
@@ -1458,7 +1710,8 @@ def user_asked(transcript, turn):
                 item["item"].get("type") == "UserMessage"
             ):
                 text = message_text(item["item"].get("content")).strip()
-                asked = asked or (bool(text) and not text.startswith("Codex Context Handoff:"))
+                # A Herdr message (worker, parent or note) is never the user's own request to transfer.
+                asked = asked or (bool(text) and not text.startswith(("Codex Context Handoff:", "<hc")))
         if started or tail >= os.path.getsize(transcript):
             return started and asked
         tail *= 4
@@ -1531,6 +1784,9 @@ def stop_hook(payload, root, terminal):
     restored = restore_check(payload, root, session)
     if restored is not None:
         return restored
+    checklist = restoration_check(payload, root, session)
+    if checklist is not None:
+        return checklist
     if disabled(root, session, turn_id):
         return {}
     state = store_for(root, session, turn_id)
@@ -1550,6 +1806,8 @@ def stop_hook(payload, root, terminal):
     notice = settle_orphans(folder, turn_id)
     if notice:
         return {"systemMessage": notice}  # the next Stop past the threshold arms again if it may
+    if failed_recently(folder, used):
+        return {}  # a switch failed here: wait for more context use (or `handoff now`)
     status, row = goal_state(transcript, session, latest.get("trigger"))
     if status == "unknown":
         return goal_wait(folder, f"could not read Goal state: {row}")  # never treated as no Goal
@@ -1573,39 +1831,139 @@ def stop_hook(payload, root, terminal):
     return {"decision": "block", "reason": handoff_request(record["nonce"]) + goal_request(goal, record["nonce"])}
 
 
+def read_ledger(state):
+    """The handoff's attempt and stage ledger (`<state>.attempts.json`)."""
+    data = read_json(state.with_suffix(".attempts.json")) or {}
+    data.setdefault("budget", BUDGET)
+    data.setdefault("attempts", [{"n": 1, "kind": "request", "at": utc_now()}])
+    data.setdefault("phase", None)
+    data.setdefault("stages", {})
+    data.setdefault("clear", None)
+    data.setdefault("sends", [])
+    return data
+
+
+def update_ledger(state, change):
+    """Read, change and atomically replace the ledger under its own lock; returns `change`'s result."""
+    with open_lock(state.with_suffix(".ledger-lock")):
+        data = read_ledger(state)
+        result = change(data)
+        replace_private(state.with_suffix(".attempts.json"), json.dumps(data))
+    return result
+
+
+def set_stage(state, name, **info):
+    """Record the first time a completion stage was reached (later calls keep the first record)."""
+    update_ledger(state, lambda data: data["stages"].setdefault(name, {"at": utc_now(), **info}))
+
+
+def set_phase(state, phase, **fields):
+    def change(data):
+        data["phase"] = phase
+        data.update(fields)
+    update_ledger(state, change)
+
+
+def take_attempt(state, kind, reason, phase):
+    """Start the next end-to-end attempt (a note re-prompt or a switch retry); None when all BUDGET are used."""
+    def change(data):
+        attempts = data["attempts"]
+        if len(attempts) >= BUDGET:
+            return None
+        if attempts and "outcome" not in attempts[-1]:
+            attempts[-1].update(outcome="retry", reason=reason, at_end=utc_now())
+        attempts.append({"n": len(attempts) + 1, "kind": kind, "phase": phase, "after": reason, "at": utc_now()})
+        return len(attempts)
+    return update_ledger(state, change)
+
+
+def finish_attempt(state, outcome, reason):
+    def change(data):
+        last = data["attempts"][-1]
+        if "outcome" not in last:
+            last.update(outcome=outcome, reason=reason, at_end=utc_now())
+    update_ledger(state, change)
+
+
+def ledger_summary(state):
+    data = read_ledger(state)
+    stages = ", ".join(data["stages"]) or "none"
+    tried = len(data["attempts"])
+    return f"attempt {tried} of {data['budget']}, phase {data['phase'] or 'none'}, stages reached: {stages}"
+
+
+def validate_note(answer, nonce):
+    """(note, None) for a valid handoff answer, else (None, why).
+
+    `missing` means no handoff marker at all (at Stop, the model's way to decline a handoff it does not
+    need); every other reason is a malformed attempt that one specific re-prompt may fix.
+    """
+    text = (answer or "").strip()
+    base = f"HANDOFF READY {nonce}"
+    marker, _, body = text.partition("\n")
+    if marker.rstrip() in {base, f"{base} GOAL transferred", f"{base} GOAL left"}:
+        if text.count("HANDOFF READY") > 1:
+            return None, "the marker line appears more than once"
+        body = body.strip()
+        if not body:
+            return None, "the handoff note after the marker line is empty"
+        if len(body) > MAX_NOTE:
+            return None, f"the handoff note is {len(body)} characters, more than {MAX_NOTE}"
+        return body + "\n", None
+    if base in text:
+        return None, "the marker line is not the first line of the final answer"
+    if re.search(r"HANDOFF READY [0-9a-f]{24}", text):
+        return None, "the marker line has another handoff's nonce"
+    if "HANDOFF READY" in text:
+        return None, "the marker line is malformed"
+    return None, "missing"
+
+
+def note_retry(state, record, why):
+    """Ask once more, with the same nonce, for a note that `why` rejected; None when no attempt is left
+    or this reason was already asked about (a re-prompt never repeats itself)."""
+    asked = [a.get("after") for a in read_ledger(state)["attempts"] if a.get("kind") == "note"]
+    if why in asked or not take_attempt(state, "note", why, "note"):
+        return None
+    lead = (
+        "the turn ended without the handoff note. " if why == "missing"
+        else f"the handoff answer was not accepted: {why}. "
+    )
+    return {"decision": "block", "reason": f"Codex Context Handoff: {lead}" + stop_request_again(record, state)}
+
+
 def capture(payload, state):
     if any(state.with_suffix(suffix).exists() for suffix in (".md", *DONE)):
         return {}
     record = json.loads(state.read_text(encoding="utf-8"))
     goal = record.get("goal")
     transfer = goal and goal["mode"] == "transfer"
-    answer = (payload.get("last_assistant_message") or "").strip()
-    marker, _, body = answer.partition("\n")
-    base = f"HANDOFF READY {record['nonce']}"
     mid_turn = record.get("origin") in {"tool", "manual"}
     # The GOAL suffix is informative only; the transfer is proven from the rollout and the DB.
-    if marker.rstrip() not in {base, f"{base} GOAL transferred", f"{base} GOAL left"} or not (
-        0 < len(body.strip()) <= MAX_NOTE
-    ):
+    note, invalid = validate_note(payload.get("last_assistant_message"), record["nonce"])
+    if invalid:
         if transfer and user_put_off(state, record):
             return put_off(state, record, "user input arrived before the Goal was paused")
-        if mid_turn and not transfer and user_spoke(record):
-            # Never ask again over the user's (or a worker's) later message.
+        if mid_turn and not transfer and user_spoke(record, state):
+            # Never ask again over the user's (or a non-worker Herdr) later message.
             return put_off(state, record, "user input arrived after the handoff was armed")
         changed = goal_changed(record) if mid_turn else None
         if changed:
             return put_off(state, record, changed)  # never ask again for a handoff that may not switch
-        if mid_turn and not record.get("stop_requested"):
-            # Armed mid-turn: the turn ended without the note, so ask once more here, with the same nonce.
-            record["stop_requested"] = True
-            replace_private(state, json.dumps(record))
-            return {"decision": "block", "reason": stop_request_again(record, state)}
+        declined = invalid == "missing" and not mid_turn  # a Stop request the model chose not to take
+        if not declined and not user_spoke(record, state):
+            again = note_retry(state, record, invalid)
+            if again:
+                return again
+        why = "no handoff note" if invalid == "missing" else f"no valid handoff note ({invalid})"
         if transfer:
-            return goal_failure(state, record, "no handoff note")
-        new_private_file(state.with_suffix(".closed"), "no handoff note\n")
-        return {}
-    note = body.strip() + "\n"
-    if mid_turn and not transfer and user_spoke(record):
+            return goal_failure(state, record, why)
+        new_private_file(state.with_suffix(".closed"), why + "\n")
+        finish_attempt(state, "closed", why)
+        if declined:
+            return {}
+        return {"systemMessage": f"Context handoff: {why}, so nothing was handed off. Work continues here."}
+    if mid_turn and not transfer and user_spoke(record, state):
         # A message after a mid-turn arm cancels it even when the model still wrote the note.
         return put_off(state, record, "user input arrived after the handoff was armed")
     if transfer:
@@ -1639,8 +1997,12 @@ def capture(payload, state):
                 f"Context handoff stopped: {why}, so nothing was handed off and no Goal was touched. Work "
                 "continues here."
             )}
-    if not new_private_file(state.with_suffix(".md"), note):
+    secret = secrets.token_hex(16)
+    if not new_private_file(state.with_suffix(".restore.json"), json.dumps({"secret": secret})):
         return {}
+    if not new_private_file(state.with_suffix(".md"), note + restore_checklist(state, secret, transfer)):
+        return {}
+    set_stage(state, "note-valid", sha256=digest(note))
     if not guard_busy(state, record):
         arm_guard(state, record)  # the switch arms it again once it holds the terminal lock
     with os.fdopen(
@@ -1651,11 +2013,37 @@ def capture(payload, state):
             stdin=subprocess.DEVNULL, stdout=output, stderr=output, start_new_session=True,
         )
     return {"systemMessage": (
-        f"Context handoff ready: a fresh chat starts in about {grace():g}s. Type anything or "
-        "submit `handoff off` to cancel; the note stays in the plugin data directory."
+        f"Context handoff ready: the note is saved and a fresh chat starts in about {grace():g}s. Type anything "
+        "or submit `handoff off` to cancel; submit `handoff status` if no fresh chat appears."
         + (" The Goal is paused here and will be recreated in the fresh chat; if the handoff is "
            "cancelled it stays paused (resume it with /goal)." if transfer else "")
     )}
+
+
+def read_token(secret, revision):
+    """The note's read token at a revision: each held worker message appended to the note makes a new one."""
+    return hashlib.sha256(f"{secret}:{revision}".encode()).hexdigest()[:20]
+
+
+def restore_checklist(state, secret, transfer):
+    first = (
+        "1. First, before anything else, call create_goal exactly as the Goal transfer section says.\n"
+        if transfer else ""
+    )
+    step = 2 if transfer else 1
+    return (
+        "\n## Restore checklist (Codex Context Handoff)\n\n"
+        + first
+        + f"{step}. Read this whole note, including every \"Held worker message\" section the plugin adds "
+        "below while the chat switches.\n"
+        f"{step + 1}. Review the Herdr workers started from this terminal: run `codex context-handoff workers`, "
+        "read each worker's result, then record a decision for every listed worker with `codex context-handoff "
+        "workers decide <id> keep|reuse|close --reason \"...\"` (close only after its result is captured), and "
+        "finish with `codex context-handoff workers done`.\n"
+        f"{step + 2}. Confirm with `codex context-handoff restored --token <token>`, using the last Read token "
+        "line in this note.\n"
+        f"\nRead token (revision 0): {read_token(secret, 0)}\n"
+    )
 
 
 def tool_hook(payload, root, terminal):
@@ -1742,11 +2130,34 @@ def control_hook(payload, root, terminal):
     ) + ".")
     for state in pending(folder):
         stage = "switch pending" if state.with_suffix(".md").exists() else "armed, waiting for a note"
-        lines.append(f"Pending handoff {state.name}: {stage}.")
+        lines.append(f"Pending handoff {state.name}: {stage} ({ledger_summary(state)}).")
+    latest = latest_outcome(folder)
+    if latest:
+        lines.append(latest)
+    received, _ = received_handoff(folder, root)
+    if received is not None and not received.with_suffix(".restored").exists():
+        lines.append("This chat received handoff " + received.name + "; restore not confirmed yet: "
+                     + "; ".join(restoration_missing(received)) + ".")
     paused = latest_goal_transfer(folder)
     if paused:
         lines.append(paused)
     return {"decision": "block", "reason": "Codex Context Handoff: " + " ".join(lines)}
+
+
+def latest_outcome(folder):
+    """A status line for this chat's latest finished handoff that did not reach a fresh chat."""
+    if not folder.is_dir():
+        return ""
+    finished = [p for p in folder.iterdir() if ID.fullmatch(p.name) and p.is_file()
+                and (p.with_suffix(".closed").exists() or p.with_suffix(".cancelled").exists())
+                and not p.with_suffix(".received").exists()]
+    if not finished:
+        return ""
+    state = max(finished, key=lambda p: p.stat().st_mtime)
+    marker = state.with_suffix(".cancelled") if state.with_suffix(".cancelled").exists() else state.with_suffix(".closed")
+    why = marker.read_text(encoding="utf-8").strip().splitlines()[0] if marker.read_text(encoding="utf-8").strip() else "?"
+    return (f"Last handoff {state.name} {marker.suffix[1:]}: {why} ({ledger_summary(state)}); note "
+            f"{state.with_suffix('.md') if state.with_suffix('.md').exists() else 'not written'}.")
 
 
 def latest_goal_transfer(folder):
@@ -1787,10 +2198,23 @@ def footer_prompt(screen):
     """(prompt line, line beneath it) from the footer, or None when the footer has no prompt."""
     lines = screen.rstrip().splitlines()
     # The prompt must be in the footer, beneath any transcript or dialogs.
-    for index in range(len(lines) - 1, max(len(lines) - 5, -1), -1):
-        if lines[index].startswith("›"):
-            return lines[index], lines[index + 1] if index + 1 < len(lines) else ""
+    for index in range(len(lines) - 1, max(len(lines) - 1 - WRAPPED_FOOTER, -1), -1):
+        if not lines[index].startswith("›"):
+            continue
+        beneath = lines[index + 1:]
+        # Within the usual footer, or the placeholder above a status that a narrow terminal wrapped.
+        if len(beneath) < FOOTER or (lines[index].rstrip() == PLACEHOLDER and wrapped_status(beneath)):
+            return lines[index], beneath[0] if beneath else ""
+        return None
     return None
+
+
+def wrapped_status(beneath):
+    """Whether the lines beneath the placeholder are one blank line and then only status lines."""
+    return (
+        not beneath[0].strip() and all(line.strip() for line in beneath[1:])
+        and not any(line.strip().startswith(DIALOG) or "esc to cancel" in line for line in beneath)
+    )
 
 
 def composer_text(screen):
@@ -1915,11 +2339,13 @@ def stopped(state):
 
 
 def continuation(record, state):
+    # Fixed once the note is written: nothing in it changes when worker messages are held later, so the
+    # prompt hook can compare it exactly.
     return (
         f"Codex Context Handoff: {record['session']} {record['turn']} {record['nonce']} "
-        f"Read the local handoff note at {json.dumps(str(state.with_suffix('.md')))}. Check the working "
-        "tree and live Herdr workers before resuming the remaining work. Preserve the user's scope and "
-        "decisions."
+        f"Read the local handoff note at {json.dumps(str(state.with_suffix('.md')))} and follow its restore "
+        "checklist. Check the working tree and live Herdr workers before resuming the remaining work. Preserve "
+        "the user's scope and decisions."
         + (" A Goal was transferred with this handoff: before anything else, call create_goal with exactly the "
            "objective and token_budget from the note's \"Goal transfer\" section and print its raw result."
            if state.with_suffix(".goal.json").is_file() else "")
@@ -1933,30 +2359,116 @@ def herdr_turn(info):
     return turn
 
 
-def await_old_chat(record, start_turn):
+class Retryable(RuntimeError):
+    """A switch failure that a later safe idle boundary may recover: a technical problem, or a verified
+    worker message that was held. `phase` is where the next attempt starts (pre-clear or post-clear)."""
+
+    def __init__(self, message, phase):
+        super().__init__(message)
+        self.phase = phase
+
+
+def held_entries(state):
+    """The worker messages held for this handoff (`<state>.held.jsonl`), in order."""
+    try:
+        lines = state.with_suffix(".held.jsonl").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    entries = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
+
+
+def held_count(state):
+    """Distinct held messages: the note's read token revision."""
+    return len(held_entries(state))
+
+
+def held_events(state):
+    """Every held delivery, repeats included (`<state>.held-events.jsonl`): what the switch watches."""
+    try:
+        lines = state.with_suffix(".held-events.jsonl").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    events = []
+    for line in lines:
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            continue
+    return [e for e in events if isinstance(e, dict)]
+
+
+def held_seen(state):
+    return len(held_events(state))
+
+
+def may_be_held(problem):
+    """Whether a fresh-chat problem could be the trace of a worker message the prompt hook is holding
+    (a short busy period, a new prompt line, another Herdr turn); drafts, dialogs, cancellations and
+    a missing guard are final at once."""
+    return any(sign in problem for sign in (
+        "ran something besides", "(old history)", "reported done", "The fresh chat changed",
+    ))
+
+
+def settle_change(state, record, held_base, phase, final):
+    """The screen or Herdr turn changed: give the UserPromptSubmit hook a moment to record why.
+
+    A worker message it held makes the change retryable; a cancellation (a person's prompt or `handoff
+    off`) or no explanation at all is final.
+    """
+    deadline = time.monotonic() + INPUT_SETTLE
+    while True:
+        if stopped(state):
+            raise RuntimeError("Handoff was cancelled (a prompt was submitted or the handoff was turned off).")
+        if held_seen(state) > held_base:
+            raise Retryable("A Herdr worker message arrived and was held for the fresh chat.", phase)
+        if time.monotonic() >= deadline:
+            raise RuntimeError(final)
+        time.sleep(POLL)
+
+
+def await_old_chat(record, state, start_turn, held_base, wait=12.0):
     """Return (screen, Herdr turn) once the finished turn's chat shows an empty, idle prompt."""
-    deadline = time.monotonic() + 12
+    deadline = time.monotonic() + wait
     previous = None
     while time.monotonic() < deadline:
+        if stopped(state):
+            raise RuntimeError("Handoff was cancelled before /clear.")
         turn = recent_turn(record["transcript"])
         info = terminal_info(record["terminal"], record["cwd"], record["pid"])
-        if not turn or turn["id"] != record["turn"] or not info:
-            break
+        if not info:
+            raise RuntimeError("The terminal no longer runs the original Codex in this worktree.")
+        if not turn or turn["id"] != record["turn"]:
+            raise RuntimeError("A new turn started in the original chat before /clear.")
         status = active_status(info)
+        if status in {"blocked", "error"}:
+            raise RuntimeError(f"The original chat reported {status}; check the terminal.")
         # Only the turn that wrote the note may end here: one step past the switch's start.
-        if not start_turn <= herdr_turn(info) <= start_turn + 1:
-            break
-        if status in {"blocked", "error"} or (turn["complete"] and status == "working" and previous is not None):
-            break
+        if not start_turn <= herdr_turn(info) <= start_turn + 1 or (
+            turn["complete"] and status == "working" and previous is not None
+        ):
+            settle_change(state, record, held_base, "pre-clear", "The original chat ran something else before /clear.")
         if turn["complete"] and status in {"done", "idle"}:
-            current = (read_composer(record["terminal"]), info["turn"])
+            screen = read_screen(record["terminal"])
+            draft = composer_text(screen) if screen is not None else None
+            if draft and not draft.startswith("<hc"):
+                raise RuntimeError("Text is in the original chat's composer; the handoff yields to it.")
+            current = (screen if draft == "" else None, info["turn"])
             if current[0] is not None and current == previous:
                 return current
             previous = current
         else:
             previous = None
         time.sleep(POLL)
-    raise RuntimeError("The original chat did not reach an empty, idle Codex prompt.")
+    raise Retryable("The original chat did not reach an empty, idle Codex prompt in time.", "pre-clear")
 
 
 def look(record):
@@ -1967,7 +2479,9 @@ def look(record):
     return active_status(info), info.get("turn"), info.get("status_ms"), read_screen(record["terminal"])
 
 
-def prompt_state(screen, old_screen):
+def prompt_state(screen, old_screen, history_ok=False):
+    """How the prompt looks. `history_ok`: the fresh chat already shows held worker messages (and the
+    hook's notice), so more than one prompt line is expected; the empty placeholder is still required."""
     if screen is None:
         return "unreadable"
     if not screen.strip():
@@ -1979,16 +2493,16 @@ def prompt_state(screen, old_screen):
         return "text in the composer"
     if screen == old_screen:
         return "old screen"
-    if sum(line.startswith("›") for line in screen.splitlines()) != 1:
+    if sum(line.startswith("›") for line in screen.splitlines()) != 1 and not history_ok:
         return "old history"
     # A fresh chat shows its placeholder; a bare prompt may hide a draft starting with a newline.
     return "fresh" if found[0].rstrip() == PLACEHOLDER else "no placeholder"
 
 
-def describe(view, old_screen):
+def describe(view, old_screen, history_ok=False):
     if view is None:
         return "terminal changed hands"
-    return f"status {view[0]}, Herdr turn {view[1]}, prompt {prompt_state(view[3], old_screen)}"
+    return f"status {view[0]}, Herdr turn {view[1]}, prompt {prompt_state(view[3], old_screen, history_ok)}"
 
 
 def source_moved(record, cache):
@@ -2001,7 +2515,7 @@ def source_moved(record, cache):
     return cache["moved"]
 
 
-def fresh_chat_problem(view, state, record, old_screen, cleared_turn, echo, cache):
+def fresh_chat_problem(view, state, record, old_screen, cleared_turn, echo, cache, history_ok=False):
     """Why the switch must stop now, or None while the fresh chat may still be starting.
 
     Codex reports `working` while MCP servers start after /clear, with the fresh, empty prompt
@@ -2029,7 +2543,7 @@ def fresh_chat_problem(view, state, record, old_screen, cleared_turn, echo, cach
         return "The fresh chat ran something besides its startup"
     if status in {"blocked", "error"}:
         return f"The fresh chat reported {status}"
-    shown = prompt_state(screen, old_screen)
+    shown = prompt_state(screen, old_screen, history_ok)
     if echo:
         # Until Codex redraws, only the old chat, the typed /clear itself, or the blank frame
         # /clear draws before the fresh chat may show.
@@ -2041,32 +2555,43 @@ def fresh_chat_problem(view, state, record, old_screen, cleared_turn, echo, cach
     elif shown == "fresh":
         return None
     if shown == "text in the composer":
+        draft = composer_text(screen) or ""
+        if draft.startswith("<hc"):
+            return None  # Herdr is pasting a worker message; its hook decides
         return "Text appeared in the composer"
     return f"No fresh, empty prompt after /clear ({shown})"
 
 
-def await_fresh_chat(record, state, old_screen, cleared_turn, cache):
-    """Return (turn, status time, screen) once the fresh chat has stayed idle at an empty prompt."""
+def await_fresh_chat(record, state, old_screen, cleared_turn, cache, rebased=False, held_base=0, history_ok=False):
+    """Return (turn, status time, screen) once the fresh chat has stayed idle at an empty prompt.
+
+    `rebased`: a later attempt in the same fresh chat (after a held worker message or a continuation
+    that provably never arrived); the Herdr turn was re-read and there is no redraw echo any more.
+    """
     start = time.monotonic()
     evidence = prompt_hook_evidence(state, record)
     # Without proof that the takeover hook runs in this process, a long busy startup is not trusted.
     limit = startup_wait() if evidence else 12.0
-    log(f"waiting up to {limit:g}s for the fresh chat (prompt hook evidence: {'yes' if evidence else 'no'})")
+    log(f"waiting up to {limit:g}s for the fresh chat (prompt hook evidence: {'yes' if evidence else 'no'}"
+        + (", same fresh chat as the previous attempt" if rebased else "") + ")")
     settled = shown = None
-    echo = True  # until Codex has redrawn: closed after CLEAR_ECHO or at the first fresh prompt
+    echo = not rebased  # until Codex has redrawn: closed after CLEAR_ECHO or at the first fresh prompt
     while True:
         now = time.monotonic()
         elapsed = now - start
         view = look(record)
-        summary = describe(view, old_screen)
+        summary = describe(view, old_screen, history_ok)
         if summary != shown:
             log(f"+{elapsed:.1f}s after /clear: {summary}")
             shown = summary
-        fresh = view is not None and prompt_state(view[3], old_screen) == "fresh"
+        fresh = view is not None and prompt_state(view[3], old_screen, history_ok) == "fresh"
         echo = echo and elapsed < CLEAR_ECHO and not fresh
-        problem = fresh_chat_problem(view, state, record, old_screen, cleared_turn, echo, cache)
+        problem = fresh_chat_problem(view, state, record, old_screen, cleared_turn, echo, cache, history_ok)
         if problem:
-            raise RuntimeError(f"{problem} {elapsed:.1f}s after /clear ({summary}).")
+            message = f"{problem} {elapsed:.1f}s after /clear ({summary})."
+            if not may_be_held(problem):
+                raise RuntimeError(message)
+            settle_change(state, record, held_base, "post-clear", message)
         if view[0] == "idle" and fresh:
             if settled is None or settled[0] != view[1:]:
                 settled = (view[1:], now)
@@ -2076,9 +2601,10 @@ def await_fresh_chat(record, state, old_screen, cleared_turn, cache):
         else:
             settled = None
         if elapsed >= limit:
-            raise RuntimeError(
-                f"The fresh chat did not settle at an idle prompt within {limit:g}s after /clear ({summary})."
-            )
+            message = f"The fresh chat did not settle at an idle prompt within {limit:g}s after /clear ({summary})."
+            if view[0] in {"working", "idle"} and view[3] is not None and composer_text(view[3]) == "":
+                raise Retryable(message, "post-clear")
+            raise RuntimeError(message)
         time.sleep(POLL)
 
 
@@ -2097,8 +2623,89 @@ def worker_status(terminal):
     return "\n".join(workers)
 
 
-def hold_for_cancel(record, state, screen, seconds, turn):
-    """Keep the idle, unchanged prompt and Herdr turn for the grace window; any change fails closed."""
+def descendants(terminals, root):
+    """{address: lineage} for every strict descendant of `root` in a Herdr snapshot."""
+    found = {}
+    for address in terminals:
+        if address == root or not TERMINAL.fullmatch(address):
+            continue
+        chain = lineage(terminals, address, root)
+        if chain:
+            found[address] = chain
+    return found
+
+
+def status_word(entry):
+    status = entry.get("status")
+    return status.get("state") if isinstance(status, dict) else status if isinstance(status, str) else None
+
+
+def session_started_ms(transcript):
+    try:
+        with Path(transcript).open("rb") as stream:
+            row = json.loads(stream.readline(1024 * 1024))
+        stamp = row.get("timestamp") or (row.get("payload") or {}).get("timestamp")
+        return calendar.timegm(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S")) * 1000
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0
+
+
+def worker_entry(entry, chain):
+    labels = entry.get("labels") if isinstance(entry.get("labels"), dict) else {}
+    foreground = entry.get("foreground") if isinstance(entry.get("foreground"), dict) else {}
+    status = entry.get("status") if isinstance(entry.get("status"), dict) else {}
+    return {
+        "address": entry["address"], "parent": entry.get("parent"), "lineage": chain, "depth": len(chain),
+        "name": entry.get("name"), "template": entry.get("template"), "labels": labels, "cwd": entry.get("cwd"),
+        "foreground": foreground.get("name"), "foreground_pid": foreground.get("pid"),
+        "state": entry.get("state"), "status": status_word(entry),
+        "status_msg": status.get("msg"), "turn": entry.get("turn"), "pid": entry.get("pid"),
+        "created_ms": entry.get("created_ms"), "finished_ms": entry.get("finished_ms"),
+        "exit_code": entry.get("exit_code"), "reason": entry.get("reason"),
+        "result_location": next((labels[k] for k in ("result", "report", "output") if labels.get(k)), None),
+    }
+
+
+def capture_manifest(record, state, into_note):
+    """Save the terminal's owned workers at the handoff: every live strict descendant, and the
+    descendants that finished during the source chat (newest 20). Other terminals never appear."""
+    terminals = hc_list(timeout=8)
+    since = session_started_ms(record["transcript"])
+    live, finished = [], []
+    for address, chain in sorted(descendants(terminals, record["terminal"]).items()):
+        entry = terminals[address]
+        if entry.get("state") == "live":
+            live.append(worker_entry(entry, chain))
+        elif type(entry.get("finished_ms")) is int and entry["finished_ms"] >= since:
+            finished.append(worker_entry(entry, chain))
+    finished = sorted(finished, key=lambda w: w["finished_ms"], reverse=True)[:20]
+    workers = live + finished
+    replace_private(state.with_suffix(".workers.json"), json.dumps({
+        "version": 1, "terminal": record["terminal"], "captured_at": utc_now(), "workers": workers,
+    }))
+    if not into_note:
+        return workers
+    lines = [f"\n## Herdr workers of {record['terminal']} at handoff\n"]
+    for worker in workers:
+        lines.append(
+            f"- {worker['address']}" + (f" {worker['name']}" if worker["name"] else "")
+            + f": {worker['state']}/{worker['status'] or 'unknown'}, parent {worker['parent']}"
+            + (f", result {worker['result_location']}" if worker["result_location"] else "")
+        )
+    if not workers:
+        lines.append("- none")
+    lines.append(f"\nWorker manifest: {state.with_suffix('.workers.json')}\n")
+    with open_lock(state.with_suffix(".note-lock")):
+        with state.with_suffix(".md").open("a", encoding="utf-8") as stream:
+            stream.write("\n".join(lines))
+            stream.flush()
+            os.fsync(stream.fileno())
+    return workers
+
+
+def hold_for_cancel(record, state, screen, seconds, turn, held_base=0):
+    """Keep the idle, unchanged prompt and Herdr turn for the grace window; a change is final unless a
+    held worker message explains it (then the next attempt waits for the next idle boundary)."""
     deadline = time.monotonic() + seconds
     while True:
         if stopped(state):
@@ -2108,15 +2715,131 @@ def hold_for_cancel(record, state, screen, seconds, turn):
         changed = goal_changed(record)
         if changed:
             raise RuntimeError(f"Stopped before /clear: {changed}.")
+        if held_seen(state) > held_base:
+            raise Retryable("A Herdr worker message arrived during the cancellation window and was held.", "pre-clear")
         info = terminal_info(record["terminal"], record["cwd"], record["pid"])
         if (
             not info or active_status(info) not in {"done", "idle"} or info.get("turn") != turn
             or read_composer(record["terminal"]) != screen
         ):
-            raise RuntimeError("The terminal changed before /clear; the handoff note is left for manual recovery.")
+            settle_change(state, record, held_base, "pre-clear",
+                          "The terminal changed before /clear; the handoff note is left for manual recovery.")
         if time.monotonic() >= deadline:
             return
         time.sleep(POLL)
+
+
+def reconcile_clear(record, old_screen, turn, error):
+    """`hc keys /clear` failed: was it typed? Polls through Codex's redraw; only a provable answer continues."""
+    deadline = time.monotonic() + CLEAR_ECHO + 2.0
+    unchanged_since = None
+    while True:
+        try:
+            view = look(record)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            view = None
+        if view is None:
+            raise RuntimeError(f"Could not tell whether /clear was typed ({error}); inspect the terminal.")
+        status, now_turn, _, screen = view
+        if prompt_state(screen, old_screen) == "fresh":
+            log(f"/clear reconciled: a fresh chat is on screen after {error}")
+            return {"turn": turn, "status": "idle", "reconciled": True}
+        if screen == old_screen and now_turn == turn and status in {"done", "idle"}:
+            unchanged_since = unchanged_since or time.monotonic()
+            if time.monotonic() - unchanged_since >= 1.0:
+                raise Retryable(f"/clear was not typed ({error}).", "pre-clear")
+        else:
+            unchanged_since = None
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Could not tell whether /clear was typed ({error}); inspect the terminal.")
+        time.sleep(POLL)
+
+
+def sessions_dir(transcript):
+    path = Path(transcript)
+    parents = path.parents
+    if path.name.startswith("rollout-") and len(parents) > 3 and parents[3].name == "sessions":
+        return parents[3]
+    return None
+
+
+def continuation_rollouts(record, since):
+    """Rollouts of other chats in the same worktree, written since `since`, whose user message starts
+    with this handoff's continuation (the source transcript, which holds the nonce, is excluded)."""
+    folder = sessions_dir(record["transcript"])
+    if folder is None:
+        return []
+    prefix = f"Codex Context Handoff: {record['session']} {record['turn']} {record['nonce']}"
+    source = Path(record["transcript"]).resolve()
+    found = []
+    for path in folder.glob("*/*/*/rollout-*.jsonl"):
+        try:
+            if path.stat().st_mtime < since or path.resolve() == source:
+                continue
+            with path.open("rb") as stream:
+                meta = (json.loads(stream.readline(1024 * 1024)).get("payload") or {})
+            if meta.get("id") == record["session"] or not same_cwd(meta.get("cwd"), record["cwd"]):
+                continue
+            if prefix.encode() not in path.read_bytes():
+                continue
+            for row_type, item in transcript_rows(path, os.path.getsize(path), (b'"event_msg"',)):
+                message = item.get("item") if item.get("type") == "item_completed" else None
+                if isinstance(message, dict) and message.get("type") == "UserMessage" and message_text(
+                    message.get("content")
+                ).strip().startswith(prefix):
+                    found.append(str(path))
+                    break
+        except (OSError, ValueError, AttributeError):
+            continue
+    return found
+
+
+def reconcile_receipt(record, state, old_screen, send_turn, typed_at, history_ok):
+    """No receipt within RECEIPT_WAIT: wait longer, then decide from the evidence whether the
+    continuation arrived. Only a continuation that provably never arrived may be sent again."""
+    receipt = state.with_suffix(".received")
+    deadline = time.monotonic() + RECONCILE_WAIT
+    while time.monotonic() < deadline:
+        if receipt.is_file():
+            return True
+        if stopped(state):
+            raise RuntimeError("Handoff was cancelled after the continuation was sent.")
+        time.sleep(POLL)
+    view = look(record)
+    if view is None:
+        raise RuntimeError("The terminal changed hands after the continuation was sent; inspect it before retrying.")
+    status, turn, _, screen = view
+    draft = composer_text(screen) if screen is not None else None
+    if draft and record["nonce"] in draft:
+        raise RuntimeError(
+            "The continuation was left unsubmitted in the composer; it was not sent again. Inspect the terminal."
+        )
+    evidence = []
+    if screen and record["nonce"] in screen:
+        evidence.append("it shows in the chat")
+    if turn != send_turn:
+        evidence.append(f"Herdr's turn moved from {send_turn} to {turn}")
+    rollouts = continuation_rollouts(record, typed_at - 2.0)
+    if rollouts:
+        evidence.append(f"a new chat's transcript has it ({rollouts[0]})")
+    if receipt.is_file():
+        return True  # received while the evidence was gathered
+    if evidence:
+        raise RuntimeError(
+            "Continuation delivery could not be confirmed, but it may have arrived (" + "; ".join(evidence)
+            + "). It was not sent again; inspect the terminal."
+        )
+    if receipt.is_file():
+        return True
+    if status == "idle" and not draft and prompt_state(screen, old_screen, history_ok) == "fresh":
+        update_ledger(state, lambda data: data["sends"][-1].update(delivery_absent=True) if data["sends"] else None)
+        raise Retryable(
+            "The continuation did not arrive (empty prompt, Herdr turn unchanged, no transcript has it).", "post-clear"
+        )
+    raise RuntimeError(
+        f"Continuation delivery could not be confirmed ({describe(view, old_screen, history_ok)}). Inspect the "
+        "terminal before retrying."
+    )
 
 
 def switch_chat(state):
@@ -2124,6 +2847,7 @@ def switch_chat(state):
     terminal = record["terminal"]
     lock_path = state.parent.parent / f"{terminal}.lock"
     fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    failure = None
     with os.fdopen(fd, "w") as lock:
         try:
             try:
@@ -2134,80 +2858,384 @@ def switch_chat(state):
         except BaseException as error:
             # Close before disarming, so a late continuation always meets .closed or the guard.
             new_private_file(state.with_suffix(".closed"), f"{error}\n{goal_paused_line(state)}")
+            contended = "Another handoff is switching" in str(error)
+            if not contended:
+                report_failure(state, record, error)
+            failure = (error, contended)
             raise
         finally:
-            disarm_guard(state, record)
+            if failure is None or not failure[1]:
+                disarm_guard(state, record)
+            lock.close()  # released before any notice is typed into the terminal
+            if failure is not None and not failure[1]:
+                try:
+                    announce_failure(state, record)
+                except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                    log(f"failure notice kept for the next hook ({type(error).__name__}: {error})")
+
+
+def report_failure(state, record, error):
+    """Make a switch that stopped visible: a notice for whichever chat is on the terminal, and no new
+    automatic handoff in that chat until more context is used (a human cancellation excepted)."""
+    try:
+        finish_attempt(state, "failed", str(error))
+        held = held_count(state)
+        cancelled = state.with_suffix(".cancelled").exists() or (state.parent / ".off").exists()
+        text = (
+            f"Context handoff did not complete: {error} ({ledger_summary(state)}). The handoff note is "
+            f"{state.with_suffix('.md')}" + (f"; it holds {held} worker message(s) that never reached a chat" if held else "")
+            + ". Check the terminal; if the work should continue, read the note in a fresh chat."
+            + (f" {goal_paused_line(state)}" if goal_paused_line(state) else "")
+        )
+        post_notice(state.parent.parent, record["terminal"], text)
+        if not cancelled:
+            replace_private(state.parent / ".switch-failed", json.dumps({
+                "usage": record.get("usage") or 0, "turn": record["turn"], "at": utc_now(), "why": str(error),
+            }))
+    except (OSError, ValueError, KeyError):
+        pass
+
+
+NOTICE_PROMPT = re.compile(r"Codex Context Handoff notice ([0-9a-f]{16})\Z")
+
+
+def post_notice(root, terminal, text):
+    notice_id = secrets.token_hex(8)
+    replace_private(root / f"{terminal}.notice", json.dumps({"text": text, "at": utc_now(), "id": notice_id}))
+    return notice_id
+
+
+def announce_failure(state, record):
+    """Show a failed switch at once instead of waiting for the person's next prompt: submit, once, the
+    plugin's own notice prompt, which its UserPromptSubmit hook blocks (it never reaches the model) and
+    answers with the notice. Runs after the guard and the terminal lock were released. Every doubt
+    leaves only the durable notice for the next hook in that terminal."""
+    terminal, root = record["terminal"], state.parent.parent
+    notice = read_json(root / f"{terminal}.notice")
+    def skip(why):
+        log(f"failure notice kept for the next hook ({why})")
+        return False
+    if not notice or not isinstance(notice.get("id"), str):
+        return skip("no notice")
+    if stopped(state) or state.with_suffix(".received").exists():
+        return skip("cancelled or delivered")
+    if not prompt_hook_evidence(state, record):
+        return skip("no proof that the prompt hook runs in this Codex process")
+    if not new_private_file(state.with_suffix(".notified"), utc_now() + "\n"):
+        return skip("already announced")
+    ledger = read_ledger(state)
+    phase, clear, sends = ledger.get("phase"), ledger.get("clear") or {}, ledger.get("sends") or []
+    # Never while /clear or the continuation may be on its way: only a send proven absent is settled.
+    if phase in {"clearing", "sending", "sent"} or any(not send.get("delivery_absent") for send in sends):
+        return skip(f"{phase}: the continuation may be in flight")
+    info = None
+    deadline = time.monotonic() + 2.0
+    while True:
+        info = terminal_info(terminal, record["cwd"], record["pid"])
+        if not info or active_status(info) == "idle" or time.monotonic() >= deadline:
+            break
+        time.sleep(POLL)
+    # Only `idle`: `hc send --if idle` makes Herdr refuse atomically if anything starts meanwhile.
+    if not info or active_status(info) != "idle":
+        return skip(f"status {active_status(info) if info else 'gone'}")
+    screen = read_screen(terminal)
+    if screen is None or composer_text(screen) != "" or record["nonce"] in screen:
+        return skip("the composer is not empty or the screen is unreadable")
+    turn = info.get("turn")
+    if clear.get("typed_at") is None:
+        latest = recent_turn(record["transcript"])
+        if not latest or latest["id"] != record["turn"]:
+            return skip("the original chat moved on")
+        rows = rows_after(record["transcript"], record.get("offset"))
+        if rows is None or user_input(rows, record.get("prompt"), input_counter(state, record)):
+            return skip("input arrived in the original chat")
+    else:
+        found = footer_prompt(screen)
+        fresh_held = [e for e in held_events(state) if e.get("session") != record["session"]]
+        if type(turn) is not int or type(clear.get("turn")) is not int or turn > clear["turn"] + 1 + len(fresh_held) \
+                or not found or found[0].rstrip() != PLACEHOLDER or (
+                    not fresh_held and sum(line.startswith("›") for line in screen.splitlines()) != 1):
+            return skip("the fresh chat is not at its clean, empty prompt")
+    if not (root / f"{terminal}.notice").is_file():
+        return skip("the notice was shown meanwhile")
+    args = ["send", "--json", "--if", "idle", terminal, f"Codex Context Handoff notice {notice['id']}"]
+    try:
+        sent = hc(*args, timeout=6)
+    except (subprocess.SubprocessError, ValueError) as error:
+        return skip(f"hc send failed: {type(error).__name__}")
+    log(f"failure notice sent: {json.dumps(sent)}")
+    return True
+
+
+def notice_hook(payload, root, terminal):
+    """The plugin's own notice prompt: always blocked, answered with the pending notice (if still there)."""
+    match = NOTICE_PROMPT.fullmatch((payload.get("prompt") or "").strip())
+    if not match:
+        return None
+    path = root / f"{terminal}.notice" if TERMINAL.fullmatch(terminal or "") else None
+    data = read_json(path) if path else None
+    if data and data.get("id") == match.group(1):
+        text = pop_notice(root, terminal)
+        if text:
+            return {"decision": "block", "reason": text}
+    return {"decision": "block", "reason": "Codex Context Handoff: this notice was already shown."}
+
+
+def pop_notice(root, terminal):
+    """The pending notice for this terminal, shown once by whichever hook runs there next."""
+    if not TERMINAL.fullmatch(terminal or ""):
+        return None
+    path = root / f"{terminal}.notice"
+    taken = path.with_name(f".{path.name}.{os.getpid()}.taken")
+    try:
+        os.rename(path, taken)
+    except OSError:
+        return None
+    data = read_json(taken)
+    taken.unlink(missing_ok=True)
+    return data.get("text") if data and isinstance(data.get("text"), str) else None
+
+
+def failed_recently(folder, used):
+    """Whether a switch in this chat failed and too little context was used since to try again."""
+    data = read_json(folder / ".switch-failed")
+    if not data:
+        return False
+    return used is None or used < float(data.get("usage") or 0) + RETRY_GROWTH
 
 
 def switch_locked(record, state):
-    terminal = record["terminal"]
-    note = state.with_suffix(".md")
-    receipt = state.with_suffix(".received")
     arm_guard(state, record)
-    start_turn = herdr_turn(terminal_info(terminal, record["cwd"], record["pid"]))
-    log(f"switch for {terminal} (pid {record['pid']}) started at Herdr turn {start_turn}")
-    workers = worker_status(terminal)
-    if workers:
-        with note.open("a", encoding="utf-8") as stream:
-            stream.write(f"\nLive Herdr children of {terminal} at handoff:\n{workers}\n")
-    screen, turn = await_old_chat(record, start_turn)
+    set_stage(state, "switch-started")
+    context = {}
+    while True:
+        try:
+            switch_attempt(record, state, context)
+            return
+        except Retryable as error:
+            attempt = take_attempt(state, "switch", str(error), error.phase)
+            if attempt is None:
+                raise RuntimeError(f"{error} All {BUDGET} attempts are used.") from None
+            log(f"retryable: {error} Attempt {attempt} of {BUDGET} starts at {error.phase}.")
+            if error.phase == "pre-clear":
+                set_phase(state, "pre-clear", clear=None, rebase=False)
+            else:
+                set_phase(state, "post-clear", rebase=True)
+            pause_before_retry(record, state)
+
+
+def pause_before_retry(record, state, seconds=1.0):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if stopped(state):
+            raise RuntimeError("Handoff was cancelled before the retry.")
+        if consent_revoked(state):
+            raise RuntimeError(f"{consent_revoked(state)} before the retry.")
+        changed = goal_changed(record)
+        if changed:
+            raise RuntimeError(f"Stopped before the retry: {changed}.")
+        time.sleep(POLL)
+
+
+def switch_attempt(record, state, context):
+    phase = read_ledger(state)["phase"]
+    if phase in {"clearing", "sending"}:
+        raise RuntimeError(f"An earlier step stopped while {phase}; inspect the terminal before retrying.")
+    try:
+        if phase in {None, "pre-clear", "switch-started"}:
+            pre_clear(record, state, context)
+        post_clear(record, state, context)
+    except (subprocess.SubprocessError, json.JSONDecodeError) as error:
+        now = read_ledger(state)["phase"]
+        if now in {"clearing", "sending", "sent"}:
+            raise RuntimeError(f"Herdr did not answer while {now} ({type(error).__name__}).") from None
+        raise Retryable(f"Herdr did not answer ({type(error).__name__}: {error}).",
+                        "post-clear" if now in {"cleared", "post-clear"} else "pre-clear") from None
+
+
+def pre_clear(record, state, context):
+    terminal = record["terminal"]
+    set_phase(state, "pre-clear")
+    info = terminal_info(terminal, record["cwd"], record["pid"])
+    if not info:
+        raise RuntimeError("The terminal no longer runs the original Codex in this worktree.")
+    start_turn = herdr_turn(info)
+    first = not context.get("pre_clear_runs")
+    context["pre_clear_runs"] = context.get("pre_clear_runs", 0) + 1
+    log(f"switch for {terminal} (pid {record['pid']}) at Herdr turn {start_turn}"
+        + ("" if first else f" (attempt {len(read_ledger(state)['attempts'])} of {BUDGET})"))
+    capture_manifest(record, state, into_note=first)
+    held_base = held_seen(state)
+    screen, turn = await_old_chat(record, state, start_turn, held_base, 12.0 if first else RETRY_IDLE_WAIT)
+    set_stage(state, "old-idle")
     log(f"old chat idle at Herdr turn {turn}; holding {grace():g}s for cancellation")
-    hold_for_cancel(record, state, screen, grace(), turn)
+    hold_for_cancel(record, state, screen, grace(), turn, held_base)
     latest = recent_turn(record["transcript"])
     if not latest or latest["id"] != record["turn"]:
         raise RuntimeError("A new turn started before /clear.")
-    hold_for_cancel(record, state, screen, 0, turn)  # final recheck immediately before /clear
-    cleared = hc("keys", "--json", terminal, "/", "c", "l", "e", "a", "r", "enter")
+    hold_for_cancel(record, state, screen, 0, turn, held_base)  # final recheck immediately before /clear
+    set_stage(state, "grace-held")
+    intent = time.time()
+    set_phase(state, "clearing", clear={"intent_at": intent, "turn": turn})
+    try:
+        cleared = hc("keys", "--json", terminal, "/", "c", "l", "e", "a", "r", "enter")
+    except (subprocess.SubprocessError, ValueError) as error:
+        cleared = reconcile_clear(record, screen, turn, f"{type(error).__name__}: {error}")
     log(f"/clear sent: {json.dumps(cleared)}")
     # hc keys waits for a quiet moment first; the chat must still be the one just checked.
     if cleared.get("turn") != turn or cleared.get("status") not in {"done", "idle"}:
         raise RuntimeError(f"The terminal changed while /clear was typed ({json.dumps(cleared)}).")
-    cache = {}
-    settled = await_fresh_chat(record, state, screen, turn, cache)
-    # Final recheck immediately before the continuation; one send, never retried.
+    typed = time.time()
+    set_phase(state, "cleared", clear={"intent_at": intent, "typed_at": typed, "turn": turn, "result": cleared})
+    set_stage(state, "cleared")
+    context.update(old_screen=screen, cleared_turn=turn, typed_at=typed)
+
+
+def post_clear(record, state, context):
+    ledger = read_ledger(state)
+    if "old_screen" not in context:
+        raise RuntimeError("The switch lost track of the screen before /clear; inspect the terminal.")
+    old_screen, typed_at = context["old_screen"], context["typed_at"]
+    rebased = bool(ledger.get("rebase"))
+    set_phase(state, "post-clear")
+    held_base = held_seen(state)
+    # The fresh chat already shows held worker messages: the hold itself proves the prompt hook runs there.
+    history_ok = rebased and any(entry.get("session") != record["session"] for entry in held_events(state))
+    cleared_turn = context["cleared_turn"]
+    if rebased:
+        view = look(record)
+        if view is None or type(view[1]) is not int:
+            raise RuntimeError("The terminal no longer runs the original Codex in this worktree.")
+        cleared_turn = view[1]
+        context["cleared_turn"] = cleared_turn
+    cache = context.setdefault("cache", {})
+    settled = await_fresh_chat(record, state, old_screen, cleared_turn, cache, rebased, held_base, history_ok)
+    set_stage(state, "fresh-ready")
+    # Final recheck immediately before the continuation.
     view = look(record)
-    problem = fresh_chat_problem(view, state, record, screen, turn, False, cache)
+    problem = fresh_chat_problem(view, state, record, old_screen, cleared_turn, False, cache, history_ok)
+    if problem and not may_be_held(problem):
+        raise RuntimeError(f"{problem} just before the continuation ({describe(view, old_screen, history_ok)}).")
     if problem or view[0] != "idle" or view[1:] != settled:
-        raise RuntimeError(
-            f"{problem or 'The fresh chat changed'} just before the continuation ({describe(view, screen)})."
-        )
-    sent = hc("send", "--json", "--if", "idle", terminal, continuation(record, state))
+        settle_change(state, record, held_base, "post-clear", (
+            f"{problem or 'The fresh chat changed'} just before the continuation "
+            f"({describe(view, old_screen, history_ok)})."
+        ))
+    send_turn = view[1]
+    update_ledger(state, lambda data: (data.update(phase="sending"), data["sends"].append(
+        {"intent_at": time.time(), "turn": send_turn}
+    )))
+    try:
+        sent = hc("send", "--json", "--if", "idle", record["terminal"], continuation(record, state))
+    except (subprocess.SubprocessError, ValueError, OSError) as error:
+        sent = {"error": f"{type(error).__name__}: {error}"}
     log(f"continuation sent: {json.dumps(sent)}")
-    if not sent.get("started"):
-        raise RuntimeError("Herdr did not accept the continuation prompt.")
-    deadline = time.monotonic() + 12
+    update_ledger(state, lambda data: (data.update(phase="sent"), data["sends"][-1].update(
+        sent_at=time.time(), result=sent
+    )))
+    set_stage(state, "continuation-sent")
+    receipt = state.with_suffix(".received")
+    deadline = time.monotonic() + (RECEIPT_WAIT if sent.get("started") else 3.0)
     while time.monotonic() < deadline:
         if receipt.is_file():
-            log(f"Continuation received by {receipt.read_text(encoding='utf-8').strip()}.")
-            return
+            break
         time.sleep(POLL)
-    raise RuntimeError("Continuation delivery could not be confirmed. Inspect the terminal before retrying.")
+    if not receipt.is_file():
+        log("no receipt yet; reconciling the delivery evidence")
+        reconcile_receipt(record, state, old_screen, send_turn, typed_at, history_ok)
+    log(f"Continuation received by {receipt.read_text(encoding='utf-8').strip()}.")
+    set_phase(state, "delivered")
+
+
+def hold_worker_message(state, record, payload, prompt, terminal):
+    """Keep a verified worker message that arrives while the switch is pending out of both chats: it is
+    appended (durably, under the note lock, deduplicated) to the held log and to the note with a new
+    read token revision, before the prompt is blocked. Returns the block reason, "pass" when the
+    continuation was received meanwhile (the message then reaches the fresh chat as usual), or None
+    when the message is not a verified worker message."""
+    verdict = InputJudge(state, terminal).verdict(prompt)
+    if verdict["kind"] not in WORKER_KINDS:
+        return None
+    session = payload.get("session_id") if ID.fullmatch(payload.get("session_id") or "") else None
+    key = digest(f"{session}\n{payload.get('turn_id') or ''}\n{prompt}")
+    secret = (read_json(state.with_suffix(".restore.json")) or {}).get("secret")
+    with open_lock(state.with_suffix(".note-lock")):
+        if state.with_suffix(".received").exists():
+            return "pass"
+        entries = held_entries(state)
+        same = next((entry for entry in entries if entry.get("key") == key), None)
+        with open(state.with_suffix(".held-events.jsonl"), "a", encoding="utf-8") as stream:
+            os.chmod(stream.name, 0o600)  # every delivery, so a repeat still explains a changed screen
+            stream.write(json.dumps({"at": utc_now(), "session": session, "key": key,
+                                     "repeat": bool(same)}) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        if same:
+            revision = same["revision"]
+        else:
+            revision = len(entries) + 1
+            entry = {
+                "revision": revision, "key": key, "at": utc_now(), "session": session, "from": verdict["sender"],
+                "kind": verdict["kind"], "why": verdict["why"], "sha256": digest(prompt), "text": prompt,
+            }
+            with open(state.with_suffix(".held.jsonl"), "a", encoding="utf-8") as stream:
+                os.chmod(stream.name, 0o600)
+                stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            shown = prompt if len(prompt) <= HELD_IN_NOTE else (
+                prompt[:HELD_IN_NOTE] + f"\n[... {len(prompt) - HELD_IN_NOTE} more characters in "
+                f"{state.with_suffix('.held.jsonl')}, revision {revision}]"
+            )
+            with state.with_suffix(".md").open("a", encoding="utf-8") as stream:
+                stream.write(
+                    f"\n## Held worker message {revision} (from {verdict['sender']}, {entry['at']})\n\n"
+                    "This message arrived while the chat switched; it was not shown to either chat.\n\n"
+                    f"{shown}\n" + (f"\nRead token (revision {revision}): {read_token(secret, revision)}\n" if secret else "")
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+    return (
+        f"Context handoff: this message from Herdr worker {verdict['sender']} was held for the fresh chat (held "
+        f"message {revision}, saved with the handoff note); it did not run here."
+    )
 
 
 def mark_takeover(payload, root, terminal):
-    """Stop this terminal's pending handoff on any prompt other than its exact continuation."""
+    """Stop this terminal's pending handoff on any prompt other than its exact continuation, except a
+    verified worker message, which is held for the fresh chat. Returns (notice, block reason)."""
     try:
         session, turn, nonce = (root / f"{terminal}.switch").read_text(encoding="utf-8").split()
         state = store_for(root, session, turn)
         record = json.loads(state.read_text(encoding="utf-8"))
         if record["nonce"] != nonce or record["terminal"] != terminal:
-            return None
+            return None, None
         expected = continuation(record, state)
     except (OSError, ValueError, KeyError, TypeError):
-        return None  # no armed guard; the switch itself fails closed without one
+        return None, None  # no armed guard; the switch itself fails closed without one
     if any(state.with_suffix(suffix).exists() for suffix in DONE):
-        return None
-    if (payload.get("prompt") or "").strip() == expected:
-        return None
+        return None, None
+    prompt = (payload.get("prompt") or "").strip()
+    if prompt == expected:
+        return None, None
+    if prompt.startswith("<hc") and state.with_suffix(".md").is_file():
+        held = hold_worker_message(state, record, payload, prompt, terminal)
+        if held == "pass":
+            return None, None
+        if held:
+            return None, held
     chat = payload.get("session_id") or ""
     goal = goal_paused_line(state)
     new_private_file(state.with_suffix(".cancelled"), (
         f"a prompt was submitted in chat {chat if ID.fullmatch(chat) else 'unknown'} before the continuation\n{goal}"
     ))
+    held = held_count(state)
     return (
         "Context handoff stopped: a prompt was submitted before the continuation. "
-        "The handoff note stays in the plugin data directory." + (f" {goal}" if goal else "")
-    )
+        "The handoff note stays in the plugin data directory."
+        + (f" It holds {held} worker message(s) that never reached a chat: {state.with_suffix('.md')}." if held else "")
+        + (f" {goal}" if goal else "")
+    ), None
 
 
 def prompt_hook(payload, root, terminal):
@@ -2252,8 +3280,13 @@ def prompt_hook(payload, root, terminal):
                 f"was not run. {goal_paused_line(state)}" + manual
             )}
         transfer = json.loads(state.with_suffix(".goal.json").read_text(encoding="utf-8"))
-    if not new_private_file(state.with_suffix(".received"), destination + "\n"):
-        return {"decision": "block", "reason": "This handoff has already been delivered."}
+    # Under the note lock: no worker message is held after the receipt, so the note (and its last read
+    # token) is final from here on, and later worker messages reach this chat directly.
+    with open_lock(state.with_suffix(".note-lock")):
+        if not new_private_file(state.with_suffix(".received"), destination + "\n"):
+            return {"decision": "block", "reason": "This handoff has already been delivered."}
+        disarm_guard(state, record)
+    set_stage(state, "delivered", chat=destination, held=held_count(state))
     # The receiving turn is checked like any other; its headroom is measured from this chat's first
     # request (baseline), so a note that starts past the threshold cannot hand off again at once.
     folder = root / destination
@@ -2274,12 +3307,426 @@ def prompt_hook(payload, root, terminal):
     )}}
 
 
+def received_handoff(folder, root):
+    """(source state, record) of the handoff this chat received, or (None, None)."""
+    try:
+        source, turn = (folder / ".received-from").read_text(encoding="utf-8").split()
+        state = store_for(root, source, turn)
+        record = json.loads(state.read_text(encoding="utf-8"))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, None
+    return state, record
+
+
+def restoration_missing(state):
+    """What the destination still has to do before the handoff counts as restored."""
+    missing = []
+    if manifest_entries(state) and not state.with_suffix(".workers-report.json").is_file():
+        missing.append("review the Herdr workers (`codex context-handoff workers`, then `workers decide` for "
+                       "each and `workers done`)")
+    missing.append("confirm with `codex context-handoff restored --token <the last Read token in the note>`")
+    return missing
+
+
+def restoration_check(payload, root, session):
+    """Stop in the chat that received a handoff: one reminder to finish the restore checklist, then one
+    notice that it was not confirmed. A transferred Goal is confirmed first (restore_check)."""
+    folder = root / session
+    state, _ = received_handoff(folder, root)
+    if state is None or state.with_suffix(".restored").exists() or not state.with_suffix(".restore.json").is_file():
+        return None
+    if pending_restore(folder)[0] is not None:
+        return None  # create_goal comes first; restore_check handles it
+    if new_private_file(folder / ".restore-reminded", utc_now() + "\n"):
+        return {"decision": "block", "reason": (
+            "Codex Context Handoff: before you finish, complete the handoff's restore checklist (it is at the end of "
+            f"the note {state.with_suffix('.md')}): " + "; ".join(restoration_missing(state)) + "."
+        )}
+    if new_private_file(folder / ".restore-unconfirmed", utc_now() + "\n"):
+        return {"systemMessage": (
+            "Context handoff: this chat did not confirm the handoff's restore checklist (note read, worker review). "
+            f"Run `codex context-handoff status` here to see what is missing; the note is {state.with_suffix('.md')}."
+        )}
+    return None
+
+
+def end_restoration_wait(payload, root, terminal, judges=None):
+    """A person's prompt in the receiving chat before the restore was confirmed ends the reminder, so it
+    never lands in their next task; a verified worker message or a `handoff` control does not."""
+    session = payload.get("session_id") or ""
+    if not ID.fullmatch(session):
+        return None
+    folder = root / session
+    state, _ = received_handoff(folder, root)
+    if state is None or state.with_suffix(".restored").exists() or (folder / ".restore-unconfirmed").exists():
+        return None
+    if not state.with_suffix(".restore.json").is_file():
+        return None
+    if is_control(payload) or received_worker_message(payload, root, terminal, judges):
+        return None
+    new_private_file(folder / ".restore-reminded", utc_now() + "\n")
+    new_private_file(folder / ".restore-unconfirmed", "a prompt arrived first\n")
+    return (
+        "Context handoff: the restore checklist of the handoff this chat received was not confirmed before this "
+        "prompt; the plugin no longer reminds about it. `codex context-handoff status` shows what is missing."
+    )
+
+
+class Refusal(Exception):
+    pass
+
+
+def helper_context(root, need_goal=True):
+    """The chat a helper runs in, checked like `request-transfer`: the opted-in foreground Codex of this
+    Herdr terminal running this hook script, and the receiving chat of a handoff in this terminal."""
+    session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SESSION_ID") or ""
+    terminal = os.environ.get("HC_TERMINAL_ID", "")
+    if not ID.fullmatch(session):
+        raise Refusal("CODEX_THREAD_ID is missing; run this from a tool call in the Codex chat")
+    transcript = find_transcript(session)
+    if not transcript:
+        raise Refusal(f"no transcript was found for chat {session}")
+    with transcript.open("rb") as stream:
+        meta = json.loads(stream.readline(1024 * 1024)).get("payload") or {}
+    payload = {"session_id": session, "cwd": meta.get("cwd"), "transcript_path": str(transcript)}
+    info, why = check_chat(payload, terminal)
+    if not info:
+        raise Refusal(why)
+    try:
+        current = (root / session / ".hook-script").read_text(encoding="utf-8") == hook_script_record(
+            info["foreground"]["pid"]
+        )
+    except OSError:
+        current = False
+    if not current:
+        raise Refusal("this chat's Codex process has not run this version of the handoff hooks")
+    folder = root / session
+    state, record = received_handoff(folder, root)
+    if state is None:
+        raise Refusal("this chat did not receive a handoff")
+    if record.get("terminal") != terminal:
+        raise Refusal("the handoff belongs to another Herdr terminal")
+    if need_goal and pending_restore(folder)[0] is not None and not confirm_restore(folder, transcript, session):
+        raise Refusal("a Goal was transferred with this handoff: call create_goal exactly as the note says first")
+    return {"root": root, "session": session, "terminal": terminal, "folder": folder, "state": state,
+            "record": record}
+
+
+def worker_now(worker, terminals, terminal):
+    """The manifest worker's state now: live, finished, gone (no longer listed) or stale (another
+    terminal under that address, or no longer a descendant of this terminal)."""
+    entry = terminals.get(worker["address"])
+    if entry is None:
+        return "gone", None
+    if entry.get("created_ms") != worker.get("created_ms") or entry.get("parent") != worker.get("parent") or not (
+        lineage(terminals, worker["address"], terminal)
+    ):
+        return "stale", entry
+    return ("live" if entry.get("state") == "live" else "finished"), entry
+
+
+def decisions_path(state):
+    return state.with_suffix(".workers-decisions.json")
+
+
+def capture_evidence(state, address, label, strict=False):
+    """Save the worker's screen and recent history before anything else is done with it.
+
+    Herdr reports a history read of a working program as incomplete (its output keeps moving), while
+    the current screen alone reads complete. For a review (keep or reuse a running worker) the screen
+    is enough and is recorded as such (`scope` screen, `partial_history`); `strict` (before a close)
+    accepts only a complete history read.
+    """
+    folder = state.with_suffix(".workers-evidence")
+    folder.mkdir(mode=0o700, exist_ok=True)
+    result, scope = hc("read", "--json", "--lines", "400", address), "history"
+    complete = bool(result.get("complete")) if isinstance(result, dict) else False
+    if not complete and not strict:
+        screen = hc("read", "--json", "--lines", "0", address)
+        if isinstance(screen, dict) and screen.get("complete"):
+            result, scope, complete = screen, "screen", True
+    text = result.get("text", "") if isinstance(result, dict) else ""
+    path = folder / f"{address}-{label}-{int(time.time() * 1000)}.txt"
+    replace_private(path, text)
+    return {"path": str(path), "sha256": digest(text), "lines": text.count("\n"), "at": utc_now(),
+            "complete": complete, "scope": scope, "partial_history": scope != "history"}
+
+
+def workers_inspect(ctx):
+    state, terminal = ctx["state"], ctx["terminal"]
+    manifest = read_json(state.with_suffix(".workers.json"))
+    if manifest is None:
+        raise Refusal("this handoff has no worker manifest (the switch could not record one)")
+    try:
+        terminals = hc_list(timeout=8)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise Refusal(f"Herdr could not be read ({type(error).__name__})") from None
+    decisions = read_json(decisions_path(state)) or {}
+    rows = []
+    for worker in manifest.get("workers", []):
+        now, entry = worker_now(worker, terminals, terminal)
+        row = {"address": worker["address"], "name": worker.get("name"), "parent": worker.get("parent"),
+               "depth": worker.get("depth"), "at_handoff": f"{worker.get('state')}/{worker.get('status')}",
+               "now": now, "status": status_word(entry) if entry else None,
+               "result_location": worker.get("result_location"), "decision": decisions.get(worker["address"])}
+        if now in {"live", "finished"}:
+            try:
+                row["evidence"] = capture_evidence(state, worker["address"], "inspect")
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                row["evidence_error"] = f"{type(error).__name__}: {error}"
+        rows.append(row)
+    listed = {worker["address"] for worker in manifest.get("workers", [])}
+    new = sorted(a for a in descendants(terminals, terminal) if a not in listed and terminals[a].get("state") == "live")
+    undecided = [row["address"] for row in rows if row["now"] in {"live", "finished"} and not row["decision"]]
+    with open_lock(state.with_suffix(".workers-lock")):
+        review = read_json(state.with_suffix(".workers-review.json")) or {"snapshots": []}
+        review["snapshots"].append({"at": utc_now(), "chat": ctx["session"], "workers": rows, "new_workers": new})
+        replace_private(state.with_suffix(".workers-review.json"), json.dumps(review, ensure_ascii=False))
+    return {
+        "handoff": f"{ctx['record']['session']}/{ctx['record']['turn']}", "terminal": terminal, "workers": rows,
+        "new_workers_not_in_review": new, "undecided": undecided,
+        "next": ("Read each worker's result (its evidence file and any result location), then run `codex "
+                 "context-handoff workers decide <id> keep|reuse|close --reason \"...\"` for every undecided worker "
+                 "(close needs --result <where its result is captured>), then `codex context-handoff workers done`."),
+    }
+
+
+def workers_decide(ctx, address, decision, reason, result_location, cancel_working):
+    state, terminal = ctx["state"], ctx["terminal"]
+    if decision not in {"keep", "reuse", "close"}:
+        raise Refusal("the decision must be keep, reuse or close")
+    if not reason.strip():
+        raise Refusal("--reason is required")
+    worker = manifest_entries(state).get(address)
+    if worker is None:
+        raise Refusal(f"{address} is not in this handoff's worker manifest; only those workers are reviewed here")
+    if decision == "close" and not (result_location or "").strip():
+        raise Refusal("--result is required for close: say where this worker's result was captured")
+    with open_lock(state.with_suffix(".workers-lock")):
+        decisions = read_json(decisions_path(state)) or {}
+        prior = decisions.get(address)
+        if prior and prior.get("outcome") in {"closed", "already-finished"} and not (
+            decision == "close" and prior.get("decision") != "close"
+        ):
+            return {"worker": address, "decision": prior, "repeat": True}
+        try:
+            terminals = hc_list(timeout=8)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            raise Refusal(f"Herdr could not be read ({type(error).__name__})") from None
+        now, entry = worker_now(worker, terminals, terminal)
+        record = {"decision": decision, "reason": reason.strip(), "result_location": result_location, "at": utc_now(),
+                  "chat": ctx["session"], "state_now": now, "status_now": status_word(entry) if entry else None}
+        if result_location and Path(result_location).is_file():
+            try:
+                record["result_sha256"] = hashlib.sha256(Path(result_location).read_bytes()).hexdigest()
+            except OSError:
+                pass
+        if decision != "close":
+            record["outcome"] = "recorded" if now in {"live", "finished"} else "not-actionable"
+        elif now in {"gone", "stale"}:
+            record["outcome"] = "not-actionable"
+        elif now == "finished":
+            record["outcome"] = "already-finished"  # nothing to end; its screen and history stay in Herdr
+        else:
+            status = status_word(entry)
+            if status not in {"done", "idle"} and not cancel_working:
+                raise Refusal(f"{address} is {status or 'not reporting a status'}, so it is kept; close it only "
+                              "with --cancel-working after you decided its work can be cancelled")
+            closable(worker, entry, terminals, address)
+            if not any(snapshot_has(state, address)):
+                raise Refusal(f"run `codex context-handoff workers` first so {address}'s result is captured")
+            try:
+                record["evidence"] = capture_evidence(state, address, "before-close", strict=True)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                raise Refusal(f"{address}'s screen could not be saved ({type(error).__name__}), so it was not closed") from None
+            if not record["evidence"]["complete"]:
+                raise Refusal(f"Herdr gave an incomplete read of {address}'s screen and history, so it was not "
+                              "closed (a worker that is still producing output can be kept and reviewed later)")
+            # Reading the screen takes time: check everything again right before the kill.
+            try:
+                terminals = hc_list(timeout=8)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                raise Refusal(f"Herdr could not be read again before the close ({type(error).__name__})") from None
+            again, entry = worker_now(worker, terminals, terminal)
+            if again != "live":
+                raise Refusal(f"{address} changed while its screen was saved (now {again}); run `workers` again")
+            if status_word(entry) != record["status_now"]:
+                raise Refusal(f"{address} changed from {record['status_now']} to {status_word(entry)} while its screen "
+                              "was saved; run `workers` again")
+            closable(worker, entry, terminals, address)
+            killed = hc("kill", address)
+            try:
+                after = hc_list(timeout=8).get(address)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                after = None
+            ended = (isinstance(killed, dict) and killed.get("state") == "finished") or (
+                isinstance(after, dict) and after.get("state") == "finished")
+            record["kill"] = {key: killed.get(key) for key in ("state", "reason", "exit_code", "signal")} if isinstance(
+                killed, dict) else killed
+            record["outcome"] = "closed" if ended else "close-unconfirmed"
+        decisions[address] = record
+        replace_private(decisions_path(state), json.dumps(decisions, ensure_ascii=False))
+    return {"worker": address, "decision": record}
+
+
+def closable(worker, entry, terminals, address):
+    """Refuse a close that is not safe now: another program in the worker (a resumed or replaced
+    foreground), or live workers of its own (bottom-up: those are decided and closed first)."""
+    foreground = entry.get("foreground") if isinstance(entry.get("foreground"), dict) else {}
+    if worker.get("pid") is not None and entry.get("pid") != worker.get("pid"):
+        raise Refusal(f"{address} runs another process than at the handoff, so it is not closed automatically")
+    if worker.get("foreground_pid") is not None and foreground.get("pid") != worker.get("foreground_pid"):
+        raise Refusal(f"{address}'s program was restarted since the handoff, so it is not closed automatically")
+    if worker.get("foreground") and foreground.get("name") not in {None, worker.get("foreground")}:
+        raise Refusal(f"{address} runs {foreground.get('name')} now instead of {worker.get('foreground')}, so it is "
+                      "not closed automatically")
+    busy = sorted(a for a in descendants(terminals, address) if terminals[a].get("state") == "live")
+    if busy:
+        raise Refusal(f"{address} has live workers of its own ({', '.join(busy)}); close those first (the ones in "
+                      "this review with `workers decide`, any newer ones by hand)")
+
+
+def snapshot_has(state, address):
+    review = read_json(state.with_suffix(".workers-review.json")) or {}
+    for snapshot in review.get("snapshots", []):
+        for row in snapshot.get("workers", []):
+            if row.get("address") == address and (row.get("evidence") or {}).get("complete"):
+                yield True
+
+
+def workers_done(ctx):
+    state, terminal = ctx["state"], ctx["terminal"]
+    manifest = read_json(state.with_suffix(".workers.json"))
+    if manifest is None:
+        raise Refusal("this handoff has no worker manifest")
+    try:
+        terminals = hc_list(timeout=8)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise Refusal(f"Herdr could not be read ({type(error).__name__})") from None
+    decisions = read_json(decisions_path(state)) or {}
+    rows, undecided, unread, still_live = [], [], [], []
+    for worker in manifest.get("workers", []):
+        now, _ = worker_now(worker, terminals, terminal)
+        decision = decisions.get(worker["address"])
+        if not decision and now in {"live", "finished"}:
+            undecided.append(worker["address"])
+        if now in {"live", "finished"} and not any(snapshot_has(state, worker["address"])):
+            unread.append(worker["address"])
+        if decision and decision.get("decision") == "close" and now == "live":
+            still_live.append(worker["address"])
+        rows.append({"address": worker["address"], "name": worker.get("name"), "at_handoff": worker.get("state"),
+                     "now": now, "decision": decision or {"outcome": "not-actionable" if now in {"gone", "stale"}
+                                                          else "undecided"}})
+    if unread:
+        raise Refusal("these workers' screens were not saved yet (run `codex context-handoff workers`): "
+                      + ", ".join(unread))
+    if undecided:
+        raise Refusal("these workers have no decision yet: " + ", ".join(undecided))
+    if still_live:
+        raise Refusal("these workers were to be closed but are still running: " + ", ".join(still_live))
+    report = {"handoff": f"{ctx['record']['session']}/{ctx['record']['turn']}", "terminal": terminal,
+              "chat": ctx["session"], "at": utc_now(), "workers": rows}
+    replace_private(state.with_suffix(".workers-report.json"), json.dumps(report, ensure_ascii=False))
+    lines = [f"# Worker review for handoff {report['handoff']}", "", f"Terminal {terminal}, chat {ctx['session']}, "
+             f"{report['at']}. Finished workers are not removed from Herdr, so their screens and history stay "
+             "available.", "", "| Worker | At handoff | Now | Decision | Outcome | Reason | Result |",
+             "| --- | --- | --- | --- | --- | --- | --- |"]
+    for row in rows:
+        d = row["decision"]
+        lines.append(f"| {row['address']} {row['name'] or ''} | {row['at_handoff']} | {row['now']} | "
+                     f"{d.get('decision', '-')} | {d.get('outcome')} | {d.get('reason', '')} | "
+                     f"{d.get('result_location') or ''} |")
+    replace_private(state.with_suffix(".workers-report.md"), "\n".join(lines) + "\n")
+    set_stage(state, "workers-reviewed", report=str(state.with_suffix(".workers-report.json")))
+    return {"report": str(state.with_suffix(".workers-report.md")), "workers": rows}
+
+
+def confirm_restored(ctx, token):
+    state = ctx["state"]
+    secret = (read_json(state.with_suffix(".restore.json")) or {}).get("secret")
+    if not secret:
+        raise Refusal("this handoff has no restore checklist")
+    latest = held_count(state)
+    if token != read_token(secret, latest):
+        earlier = next((r for r in range(latest) if token == read_token(secret, r)), None)
+        if earlier is not None:
+            raise Refusal(f"that token is from revision {earlier}; {latest - earlier} held worker message(s) were "
+                          "added to the note after it. Read the note again and use its last Read token")
+        raise Refusal("the token does not match the note's last Read token")
+    missing = [item for item in restoration_missing(state) if not item.startswith("confirm")]
+    if missing:
+        raise Refusal("first " + "; ".join(missing))
+    new_private_file(state.with_suffix(".restored"), json.dumps({"chat": ctx["session"], "at": utc_now(),
+                                                                 "revision": latest}))
+    new_private_file(ctx["folder"] / ".restored", f"{state}\n")
+    set_stage(state, "restored", chat=ctx["session"], revision=latest)
+    return {"restored": True, "note_revision": latest, "handoff": f"{ctx['record']['session']}/{ctx['record']['turn']}"}
+
+
+def helper_status(ctx):
+    state = ctx["state"]
+    ledger = read_ledger(state)
+    return {"handoff": f"{ctx['record']['session']}/{ctx['record']['turn']}", "ledger": ledger,
+            "held_worker_messages": held_count(state), "restored": state.with_suffix(".restored").exists(),
+            "missing": [] if state.with_suffix(".restored").exists() else restoration_missing(state),
+            "goal_restore_pending": pending_restore(ctx["folder"])[0] is not None}
+
+
+def helper_main(root, argv):
+    """`codex context-handoff workers|restored|status ...`, run from a tool call in the receiving chat."""
+    import argparse
+    parser = argparse.ArgumentParser(prog="codex context-handoff")
+    commands = parser.add_subparsers(dest="command", required=True)
+    workers = commands.add_parser("workers")
+    actions = workers.add_subparsers(dest="action")
+    actions.add_parser("inspect")
+    decide = actions.add_parser("decide")
+    decide.add_argument("worker")
+    decide.add_argument("decision", choices=["keep", "reuse", "close"])
+    decide.add_argument("--reason", required=True)
+    decide.add_argument("--result")
+    decide.add_argument("--cancel-working", action="store_true")
+    actions.add_parser("done")
+    restored = commands.add_parser("restored")
+    restored.add_argument("--token", required=True)
+    commands.add_parser("status")
+    args = parser.parse_args(argv)
+    try:
+        ctx = helper_context(Path(root).resolve(), need_goal=args.command != "status")
+        if args.command == "status":
+            output = helper_status(ctx)
+        elif args.command == "restored":
+            output = confirm_restored(ctx, args.token)
+        elif args.action == "decide":
+            output = workers_decide(ctx, args.worker, args.decision, args.reason, args.result, args.cancel_working)
+        elif args.action == "done":
+            output = workers_done(ctx)
+        else:
+            output = workers_inspect(ctx)
+    except Refusal as error:
+        print(f"Codex Context Handoff: {error}.", file=sys.stderr)
+        return 2
+    print(json.dumps(output, indent=2, ensure_ascii=False))
+    return 0
+
+
+def with_notice(result, notice):
+    """Add a pending notice to a hook result without hiding its own message."""
+    if not notice:
+        return result
+    result = dict(result)
+    result["systemMessage"] = f"{result['systemMessage']} {notice}" if result.get("systemMessage") else notice
+    return result
+
+
 def main():
     if sys.argv[1:2] == ["--switch"]:
         switch_chat(Path(sys.argv[2]))
         return
     if sys.argv[1:2] == ["--request-transfer"] and len(sys.argv) == 3:
         sys.exit(request_transfer(sys.argv[2]))
+    if sys.argv[1:2] == ["--helper"] and len(sys.argv) >= 4:
+        sys.exit(helper_main(sys.argv[2], sys.argv[3:]))
     payload = json.load(sys.stdin)
     terminal = os.environ.get("HC_TERMINAL_ID", "")
     root = os.environ.get("PLUGIN_DATA")
@@ -2291,11 +3738,26 @@ def main():
     event = payload.get("hook_event_name")
     opted_in = os.environ.get("CODEX_CONTEXT_HANDOFF") == "1" and TERMINAL.fullmatch(terminal)
     if event == "UserPromptSubmit":
-        notice = mark_takeover(payload, root, terminal) if opted_in else None
+        own = notice_hook(payload, root, terminal)
+        if own is not None:
+            print(json.dumps(own), flush=True)
+            return
+        notice, held = mark_takeover(payload, root, terminal) if opted_in else (None, None)
+        if held:
+            # A worker message held for the fresh chat: it reaches neither chat's model.
+            print(json.dumps({"decision": "block", "reason": held}), flush=True)
+            return
         # Runs before prompt_hook, so only a prompt after the continuation (or a second one) cancels.
-        restore = cancel_restore(payload, root)
+        judges = {}  # one Herdr snapshot and the received handoff's manifest for this whole hook run
+        restore = cancel_restore(payload, root, terminal, judges)
         if restore:
             notice = f"{notice} {restore}" if notice else restore
+        unconfirmed = end_restoration_wait(payload, root, terminal, judges)
+        if unconfirmed:
+            notice = f"{notice} {unconfirmed}" if notice else unconfirmed
+        pending_notice = pop_notice(root, terminal) if opted_in else None
+        if pending_notice:
+            notice = f"{pending_notice} {notice}" if notice else pending_notice
         # Controls work even without the opt-in so `handoff status` can explain why.
         result = control_hook(payload, root, terminal)
         if result is not None:
@@ -2305,7 +3767,7 @@ def main():
             mark_closing(payload, root)
             result = manual_hook(payload, root, terminal) or prompt_hook(payload, root, terminal)
             if notice and "decision" not in result:
-                result["systemMessage"] = notice
+                result = with_notice(result, notice)
         elif notice:
             result = {"systemMessage": notice}
         else:
@@ -2320,11 +3782,14 @@ def main():
     if not opted_in:
         return
     if event == "Stop":
-        print(json.dumps(stop_hook(payload, root, terminal)))
+        result = stop_hook(payload, root, terminal)
     elif event == "PreToolUse":
-        print(json.dumps(gate_hook(payload, root, terminal)))
+        result = gate_hook(payload, root, terminal)
     elif event == "PostToolUse":
-        print(json.dumps(tool_hook(payload, root, terminal)))
+        result = tool_hook(payload, root, terminal)
+    else:
+        return
+    print(json.dumps(with_notice(result, pop_notice(root, terminal))))
 
 
 if __name__ == "__main__":

@@ -22,6 +22,9 @@ sets CODEX_CONTEXT_HANDOFF=1 so the handoff hooks run in the foreground process.
   run by the model from inside an opted-in chat: it finds that chat's plugin
   data (from CODEX_THREAD_ID or CODEX_SESSION_ID) and runs the installed hook
   script with --request-transfer. It never starts codex.
+- `codex context-handoff workers|restored|status ...` are the receiving chat's
+  restore helpers (worker review and restore confirmation), found and checked
+  the same way and run as the hook script's --helper. They never start codex.
 """
 
 import os
@@ -34,6 +37,7 @@ MARKER = b"codex-context-handoff launcher shim"
 TERMINAL = re.compile(r"t[0-9a-z]+\Z")
 SESSION = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 HELPER = ["context-handoff", "request-transfer"]
+RESTORE_HELPERS = {"workers", "restored", "status"}
 BYPASS = "--dangerously-bypass-approvals-and-sandbox"
 VALUE_OPTIONS = {
     "-c", "--config", "--enable", "--disable", "--remote", "--remote-auth-token-env",
@@ -135,8 +139,9 @@ def launch_plan(args):
     return 0, 0
 
 
-def request_transfer():
-    """Run the installed handoff hook's transfer helper for the chat this shell belongs to."""
+def request_transfer(extra=None):
+    """Run the installed handoff hook's transfer helper (or, with `extra`, a restore helper) for the chat
+    this shell belongs to."""
     session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SESSION_ID") or ""
     if not SESSION.fullmatch(session):
         print("codex context-handoff: no CODEX_THREAD_ID; run this from a tool call inside the Codex chat",
@@ -163,6 +168,8 @@ def request_transfer():
               "Codex through the launcher or continue in a new chat if it runs older hooks (a prompt does not upgrade "
               "it); otherwise submit any prompt in the chat first", file=sys.stderr)
         return 2
+    if extra is not None:
+        os.execv(sys.executable, [sys.executable, script, "--helper", str(roots[0]), *extra])
     os.execv(sys.executable, [sys.executable, script, "--request-transfer", str(roots[0])])
 
 
@@ -183,6 +190,8 @@ def ancestors():
 def main():
     if sys.argv[1:] == HELPER:
         return request_transfer()
+    if sys.argv[1:2] == ["context-handoff"] and sys.argv[2:3] and sys.argv[2] in RESTORE_HELPERS:
+        return request_transfer(sys.argv[2:])
     own = os.path.realpath(__file__)
     real = real_codex(own)
     if not real:
