@@ -107,6 +107,11 @@ class ContextHandoffTests(unittest.TestCase):
         logger = patch.object(handoff, "log", side_effect=self.logs.append)
         logger.start()
         self.addCleanup(logger.stop)
+        # Never ask the real Herdr: tests that need terminals set self.herdr (address -> terminal).
+        self.herdr = {}
+        lister = patch.object(handoff, "hc_list", side_effect=lambda *_, **__: self.herdr)
+        lister.start()
+        self.addCleanup(lister.stop)
 
     def write_events(self, *events):
         self.transcript.write_text("".join(json.dumps(row) + "\n" for row in events))
@@ -213,7 +218,7 @@ class ContextHandoffTests(unittest.TestCase):
         self.assertIn("handoff off", second["systemMessage"])
         self.assertEqual(third, {})
         launch.assert_called_once()
-        self.assertEqual((self.root / "session" / "turn.md").read_text(), "# Note\nNext: tests.\n")
+        self.assertTrue((self.root / "session" / "turn.md").read_text().startswith("# Note\nNext: tests.\n\n## Restore"))
 
     def test_off_before_threshold_blocks_request_and_nudge(self):
         self.write_events(self.meta, event("task_started", turn_id="turn"), event("token_count", info=usage(41)))
@@ -488,7 +493,9 @@ class ContextHandoffTests(unittest.TestCase):
     def test_second_busy_period_after_startup_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "ran something besides its startup"):
             self.fresh_wait((0, "working", 5, FRESH), (15, "idle", 6, FRESH), (16, "working", 6, FRESH))
-        self.assertAlmostEqual(self.waited, 16, delta=0.3)
+        # A worker message the prompt hook holds would look the same for a moment, so the switch waits
+        # INPUT_SETTLE for the hook's record before it stops.
+        self.assertAlmostEqual(self.waited, 16 + handoff.INPUT_SETTLE, delta=0.3)
 
     def test_dialog_or_error_during_startup_aborts(self):
         for status in ("blocked", "error"):
@@ -502,17 +509,17 @@ class ContextHandoffTests(unittest.TestCase):
         # Once the fresh prompt was seen, the old chat's status or screen may not come back.
         with self.assertRaisesRegex(RuntimeError, "reported done"):
             self.fresh_wait((0, "working", 5, FRESH), (1, "done", 5, OLD))
-        self.assertAlmostEqual(self.waited, 1, delta=0.3)
+        self.assertAlmostEqual(self.waited, 1 + handoff.INPUT_SETTLE, delta=0.3)
         with self.assertRaisesRegex(RuntimeError, "Text appeared in the composer"):
             self.fresh_wait((0, "idle", 5, draft(OLD, "/clear")))
         self.assertAlmostEqual(self.waited, handoff.CLEAR_ECHO, delta=0.3)
 
     def test_first_fresh_poll_is_checked_strictly(self):
         # The echo window closes as soon as the fresh prompt shows, on that very poll.
-        for status in ("done", None):
+        for status, settle in (("done", handoff.INPUT_SETTLE), (None, 0)):
             with self.assertRaisesRegex(RuntimeError, f"reported {status}"):
                 self.fresh_wait((0, status, 5, FRESH))
-            self.assertLess(self.waited, 0.1)
+            self.assertLess(self.waited, 0.1 + settle)
         # During the echo window only the old screen or the typed /clear may show.
         for screen in (draft(OLD, "a\n  b\n  c"), None):
             with self.assertRaisesRegex(RuntimeError, "No fresh, empty prompt"):
@@ -595,9 +602,17 @@ class ContextHandoffTests(unittest.TestCase):
         terminal = FakeTerminal(self.clock, ("done", 5, OLD), after)
         self.sent, self.cleared_at = [], None
 
+        self.herdr = {"t1": {"address": "t1", "parent": None, "state": "live"},
+                      "t2": {"address": "t2", "parent": "t1", "state": "live", "status": {"state": "working"},
+                             "created_ms": 1, "pid": 7}}
+        self.notices = []
+
         def fake_hc(*args):
             if args[0] == "ls":
                 return {"terminals": [{"address": "t2", "parent": "t1", "state": "live", "status": "working"}]}
+            if args[0] == "send" and args[-1].startswith("Codex Context Handoff notice "):
+                self.notices.append((self.clock.now, args[-1]))
+                return {"started": False, "status": "idle", "turn": 5}
             if args[0] == "keys":
                 terminal.clear()
                 self.cleared_at = self.clock.now
@@ -606,7 +621,7 @@ class ContextHandoffTests(unittest.TestCase):
                 self.assertEqual(terminal.phase()[0], "idle")
                 self.sent.append((self.clock.now, args[-1]))
                 payload = {"session_id": "fresh", "turn_id": "first", "cwd": str(self.root), "prompt": args[-1]}
-                self.assertIsNone(handoff.mark_takeover(payload, self.root, "t1"))
+                self.assertEqual(handoff.mark_takeover(payload, self.root, "t1"), (None, None))
                 self.assertEqual(handoff.prompt_hook(payload, self.root, "t1"), {})
                 return {"started": True, "status": "idle", "turn": 6}
             raise AssertionError(args)
@@ -628,7 +643,7 @@ class ContextHandoffTests(unittest.TestCase):
         self.assertEqual(state.with_suffix(".received").read_text(), "fresh\n")
         self.assertFalse(state.with_suffix(".closed").exists())
         self.assertFalse((self.root / "t1.switch").exists())
-        self.assertIn("- t2 (working)", state.with_suffix(".md").read_text())
+        self.assertIn("- t2: live/working, parent t1", state.with_suffix(".md").read_text())
         self.assertTrue(any("settled" in line for line in self.logs))
 
     def test_takeover_just_before_the_send_stops_it(self):
@@ -648,6 +663,7 @@ class ContextHandoffTests(unittest.TestCase):
                 self.run_switch([(0, "idle", 5, FRESH)], keys=keys)
             self.assertEqual(self.sent, [])
             handoff.store_for(self.root, "session", "turn").with_suffix(".closed").unlink()
+            handoff.store_for(self.root, "session", "turn").with_suffix(".attempts.json").unlink()
 
     def test_lost_lock_race_leaves_the_active_switch_guard(self):
         import fcntl
@@ -688,7 +704,7 @@ class ContextHandoffTests(unittest.TestCase):
                 state.with_suffix(suffix).unlink(missing_ok=True)
             payload = {"session_id": "fresh", "turn_id": "first", "cwd": str(self.root),
                        "prompt": mixed.format(handoff.continuation(record, state))}
-            self.assertIsNotNone(handoff.mark_takeover(payload, self.root, "t1"))
+            self.assertIsNotNone(handoff.mark_takeover(payload, self.root, "t1")[0])
             result = handoff.prompt_hook(payload, self.root, "t1")
             self.assertEqual(result["decision"], "block")
             self.assertIn("mixed with other text", result["reason"])
@@ -698,15 +714,15 @@ class ContextHandoffTests(unittest.TestCase):
     def test_takeover_spares_only_the_exact_continuation(self):
         state, record = self.armed()
         exact = {"session_id": "fresh", "prompt": handoff.continuation(record, state) + "\n"}
-        self.assertIsNone(handoff.mark_takeover(exact, self.root, "t1"))
-        self.assertIsNone(handoff.mark_takeover({"prompt": "hello"}, self.root, "t2"))  # another terminal
+        self.assertEqual(handoff.mark_takeover(exact, self.root, "t1"), (None, None))
+        self.assertEqual(handoff.mark_takeover({"prompt": "hello"}, self.root, "t2"), (None, None))  # another terminal
         self.assertFalse(state.with_suffix(".cancelled").exists())
-        notice = handoff.mark_takeover({"session_id": "fresh", "prompt": "handoff status"}, self.root, "t1")
+        notice, _ = handoff.mark_takeover({"session_id": "fresh", "prompt": "handoff status"}, self.root, "t1")
         self.assertIn("stopped", notice)
         self.assertIn("fresh", state.with_suffix(".cancelled").read_text())
         state.with_suffix(".cancelled").unlink()
         state.with_suffix(".received").write_text("fresh\n")  # already delivered: nothing to stop
-        self.assertIsNone(handoff.mark_takeover({"prompt": "hello"}, self.root, "t1"))
+        self.assertEqual(handoff.mark_takeover({"prompt": "hello"}, self.root, "t1"), (None, None))
 
     def test_user_prompt_then_queued_continuation_through_the_hook_entry_point(self):
         state, record = self.armed()
@@ -1701,7 +1717,8 @@ class GoalTransferTests(unittest.TestCase):
         for _ in range(3):
             self.assertEqual(self.pre("apply_patch"), {})
         self.assertEqual(sorted(p.name for p in (self.root / "session").iterdir() if p.name.startswith("turn")),
-                         ["turn", "turn.closed", "turn.gate", "turn.gate-lock", "turn.released"])
+                         ["turn", "turn.attempts.json", "turn.closed", "turn.gate", "turn.gate-lock", "turn.ledger-lock",
+                          "turn.released"])
         # A later turn re-arms only after 5 more points, and at most 3 attempts per chat.
         for attempt, used in ((2, 46), (3, 51)):
             self.user_turn(turn=f"t{attempt}", used=used - 1)
@@ -1784,7 +1801,7 @@ class GoalTransferTests(unittest.TestCase):
         launch.assert_called_once()
         self.assertIn("handoff off", result["systemMessage"])
         self.assertNotIn("Goal", result["systemMessage"])
-        self.assertEqual(self.state.with_suffix(".md").read_text(), "# Note\nNext: tests.\n")
+        self.assertTrue(self.state.with_suffix(".md").read_text().startswith("# Note\nNext: tests.\n\n## Restore checklist"))
         self.assertFalse(self.state.with_suffix(".goal.json").exists())
         self.assertNotIn("create_goal", handoff.continuation(json.loads(self.state.read_text()), self.state))
         # A turn that ends without the note is asked once more (same nonce), then closed.
@@ -1797,7 +1814,8 @@ class GoalTransferTests(unittest.TestCase):
         self.assertNotIn("GOAL", again["reason"])
         final, launch = self.plain_capture("Still working.")
         launch.assert_not_called()
-        self.assertEqual(final, {})
+        self.assertIn("no handoff note, so nothing was handed off", final["systemMessage"])  # visible, not silent
+        self.assertNotIn("decision", final)
         self.assertIn("no handoff note", self.state.with_suffix(".closed").read_text())
 
     def test_a_goal_appearing_after_a_no_goal_arm_never_switches(self):
@@ -1912,12 +1930,16 @@ class GoalTransferTests(unittest.TestCase):
 
     # --- the fresh chat ---
 
-    def deliver(self, destination="fresh", turn="first"):
+    def deliver(self, destination="fresh", turn="first", restored=True):
         record = json.loads(self.state.read_text())
         payload = {"session_id": destination, "turn_id": turn, "cwd": str(self.root),
                    "transcript_path": str(self.transcript), "prompt": handoff.continuation(record, self.state)}
-        self.assertIsNone(handoff.mark_takeover(payload, self.root, "t1"))
-        return handoff.prompt_hook(payload, self.root, "t1"), payload
+        self.assertEqual(handoff.mark_takeover(payload, self.root, "t1"), (None, None))
+        result = handoff.prompt_hook(payload, self.root, "t1")
+        if restored:
+            # These tests are about the Goal; the restore checklist has tests of its own.
+            self.state.with_suffix(".restored").write_text("{}")
+        return result, payload
 
     def transferred(self, budget=1_000_000):
         self.arm(token_budget=budget)
@@ -1947,7 +1969,7 @@ class GoalTransferTests(unittest.TestCase):
         record = json.loads(self.state.read_text())
         payload = {"session_id": "fresh", "turn_id": "first", "cwd": str(self.root),
                    "prompt": "hi " + handoff.continuation(record, self.state)}
-        self.assertIn("paused for this handoff", handoff.mark_takeover(payload, self.root, "t1"))
+        self.assertIn("paused for this handoff", handoff.mark_takeover(payload, self.root, "t1")[0])
         self.assertEqual(handoff.prompt_hook(payload, self.root, "t1")["decision"], "block")
         self.assertFalse((self.root / "fresh" / ".goal-restore").exists())
 
@@ -2027,7 +2049,7 @@ class GoalTransferTests(unittest.TestCase):
 
     def test_cancel_after_the_pause_leaves_the_goal_paused_and_says_so(self):
         self.transferred()
-        notice = handoff.mark_takeover({"session_id": "session", "prompt": "wait"}, self.root, "t1")
+        notice, _ = handoff.mark_takeover({"session_id": "session", "prompt": "wait"}, self.root, "t1")
         self.assertIn("The Goal of chat session was paused for this handoff and stays paused", notice)
         self.assertIn("stays paused", self.state.with_suffix(".cancelled").read_text())
         with patch.object(handoff, "check_chat", return_value=(None, "test")):
@@ -2137,13 +2159,16 @@ class GoalTransferTests(unittest.TestCase):
         self.assertFalse((self.root / "fresh" / ".goal-restore").exists())
         self.assertEqual(self.fresh_stop(turn="second"), {})  # no reminder inside the new task
         self.assertEqual(self.prompt_in_fresh("another"), {})  # told once
-        # A control prompt is a real prompt too, and its reply carries the notice.
+        # Since 0.6.0 a `handoff` control (the plugin's own advice is to submit `handoff status`) never
+        # reaches the model, so it leaves the restore check pending.
         for folder in ("session", "fresh"):
             shutil.rmtree(self.root / folder)
         self.transferred()
         self.deliver()
         with patch.object(handoff, "check_chat", return_value=(None, "test")):
-            self.assertIn("stays paused", self.prompt_in_fresh("handoff status")["reason"])
+            self.assertNotIn("stays paused", self.prompt_in_fresh("handoff status")["reason"])
+        self.assertTrue((self.root / "fresh" / ".goal-restore").exists())
+        self.assertFalse((self.root / "fresh" / ".goal-mismatch").exists())
 
     def test_a_prompt_after_the_goal_was_recreated_keeps_it(self):
         self.transferred()
@@ -2311,6 +2336,20 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(done.returncode, 2, bad)
             self.assertIn("not recorded by its running Codex process", done.stderr)
             self.assertFalse(self.record.exists())
+
+    def test_restore_helpers_run_the_recorded_hook_script_with_their_arguments(self):
+        home, root = self.helper_home()
+        for args in (("workers",), ("workers", "decide", "t2", "close", "--reason", "done", "--result", "x.md"),
+                     ("workers", "done"), ("restored", "--token", "abc"), ("status",)):
+            done = self.run_shim("context-handoff", *args, CODEX_HOME=str(home), CODEX_THREAD_ID="chat1")
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(json.loads(self.record.read_text()), ["--helper", str(root.resolve()), *args])
+            self.record.unlink()
+        # The same chat proof as the transfer helper, and unknown subcommands are not helpers.
+        done = self.run_shim("context-handoff", "workers", CODEX_HOME=str(home), CODEX_THREAD_ID="other")
+        self.assertEqual(done.returncode, 2)
+        self.assertFalse(self.record.exists())
+        self.assertNotEqual(self.launch("context-handoff", "rm-everything")["argv"][:1], ["--helper"])
 
     def test_transfer_helper_refuses_a_chat_whose_process_runs_older_hooks(self):
         # Deployment: a 0.3.0 chat (only .prompt-hook) sharing data with 0.4.0 chats, and a stray
