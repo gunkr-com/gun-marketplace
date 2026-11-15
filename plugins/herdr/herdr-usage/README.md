@@ -111,7 +111,7 @@ A CLI whose config folder does not exist is skipped. If the folder exists but `s
 | Source | How | Shown as |
 | :- | :- | :- |
 | Codex | A short-lived `codex app-server` runs `account/rateLimits/read` (15 s limit; its process group is killed afterwards). If that fails, the newest `rate_limits` event in recent `$CODEX_HOME/sessions` rollouts, with the event's own time | Live query / Codex turn log |
-| Claude Code | Existing local OAuth login (macOS Keychain or credential file) queries subscription usage directly; statusline captures remain a fallback and provide context | Live query / Session data |
+| Claude Code | Existing local OAuth login (the current user's macOS Keychain entry, as Claude Code selects it, or the credential file) queries subscription usage directly; statusline captures remain a fallback and provide context | Live query / Session data |
 | Antigravity | The CLI's read-only `-p /usage --output-format json` refreshes quota without an agent turn; statusline captures remain a fallback | Live query / Session data |
 | Ollama Cloud | `GET ollama.com/api/balance`, signed with the device key `~/.ollama/id_ed25519`, or `OLLAMA_API_KEY` as a Bearer token | Live query |
 | Ollama local | HTTP only: `127.0.0.1:11434/api/version` and `/api/ps`. The `ollama` CLI is never run | Local running / Local stopped |
@@ -237,7 +237,7 @@ Windows 설치기는 기본 native/npm Codex 설치의 `codex.exe`를 찾습니�
 ### 숫자의 출처
 
 - Codex: 짧게 띄운 `codex app-server`의 `account/rateLimits/read`(15초 제한, 끝나면 프로세스 그룹 종료). 실패하면 최근 `$CODEX_HOME/sessions` 기록의 최신 `rate_limits` 이벤트와 그 이벤트 시각
-- Claude Code: 기존 로컬 OAuth 로그인으로 구독 사용량을 직접 조회. statusLine 값은 예비 경로와 컨텍스트 표시에 사용
+- Claude Code: 기존 로컬 OAuth 로그인(Claude Code와 같은 방식으로 고른 현재 사용자의 macOS Keychain 항목, 또는 자격 증명 파일)으로 구독 사용량을 직접 조회. statusLine 값은 예비 경로와 컨텍스트 표시에 사용
 - Antigravity: 공식 CLI의 읽기 전용 `-p /usage --output-format json`으로 모델 호출 없이 한도를 새로 조회. statusLine은 예비 경로
 - Ollama Cloud: 기기 키 `~/.ollama/id_ed25519`로 서명하거나 `OLLAMA_API_KEY`를 Bearer로 보낸 `GET ollama.com/api/balance`
 - Ollama 로컬: HTTP만 사용(`127.0.0.1:11434`). `ollama` CLI는 실행하지 않습니다.
