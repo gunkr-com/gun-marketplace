@@ -754,6 +754,17 @@ class RestoreTests(Base):
         self.assertIn("no longer reminds", handoff.end_restoration_wait(dict(worker, prompt="go on"), self.root, "t1"))
         self.assertIsNone(self.stop())
 
+    def test_the_checklist_names_the_installed_launcher_and_a_non_login_shell(self):
+        checklist = handoff.restore_checklist(self.state, self.secret, False)
+        launcher = str(Path(handoff.__file__).resolve().parents[1] / "bin" / "codex")
+        self.assertIn(handoff.shlex.quote(launcher) + " context-handoff workers", checklist)
+        self.assertIn("login: false", checklist)
+        self.assertIn("login: false", handoff.continuation({"session": "s", "turn": "t", "nonce": "a" * 24}, self.state))
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": "fresh"}):
+            os.environ.pop("HC_TERMINAL_ID", None)
+            with self.assertRaisesRegex(handoff.Refusal, "HC_TERMINAL_ID is missing.*login: false"):
+                handoff.helper_context(self.root)
+
     def test_the_helpers_refuse_before_the_transferred_goal_is_recreated(self):
         transcript = self.root / "home" / "sessions" / "2026" / "11" / "14" / "rollout-x-fresh.jsonl"
         transcript.parent.mkdir(parents=True)

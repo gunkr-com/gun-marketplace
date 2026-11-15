@@ -134,7 +134,7 @@ Each handoff has a ledger, `<state>.attempts.json`, with its phase, stages and a
 
 ## Restore checklist (0.6.0)
 
-The note ends with a checklist and a read token that appears only in the note file:
+The note ends with a checklist and a read token that appears only in the note file. Its commands name this installed plugin's launcher by absolute path, and the fresh chat runs them with `exec_command` and `login: false`: a login shell can drop the chat's environment (`HC_TERMINAL_ID`, `CODEX_THREAD_ID`, `CODEX_HOME`) and find another `codex` earlier on `PATH`, and the helpers then refuse (seen with Codex 0.169). The same applies to `codex context-handoff request-transfer`.
 
 1. A transferred Goal is recreated first with `create_goal`; the helpers below refuse until it is.
 2. Read the whole note, including held worker messages.

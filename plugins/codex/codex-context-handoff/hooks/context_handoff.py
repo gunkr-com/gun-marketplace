@@ -9,6 +9,7 @@ import math
 import os
 import re
 import secrets
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -2020,6 +2021,18 @@ def capture(payload, state):
     )}
 
 
+SHELL_NOTE = (
+    "Run it with exec_command and login: false: a login shell can drop this chat's environment "
+    "(HC_TERMINAL_ID, CODEX_THREAD_ID, CODEX_HOME) and find another `codex` on PATH."
+)
+
+
+def helper_command(*args):
+    """The helper command line with this installed plugin's own launcher, by absolute path."""
+    launcher = Path(__file__).resolve().parents[1] / "bin" / "codex"
+    return " ".join([shlex.quote(str(launcher)), "context-handoff", *args])
+
+
 def read_token(secret, revision):
     """The note's read token at a revision: each held worker message appended to the note makes a new one."""
     return hashlib.sha256(f"{secret}:{revision}".encode()).hexdigest()[:20]
@@ -2031,16 +2044,17 @@ def restore_checklist(state, secret, transfer):
         if transfer else ""
     )
     step = 2 if transfer else 1
+    decide = helper_command("workers", "decide", "<id>", "keep|reuse|close", "--reason", '"..."')
     return (
         "\n## Restore checklist (Codex Context Handoff)\n\n"
+        f"Run each command below from a tool call in this chat. {SHELL_NOTE}\n\n"
         + first
         + f"{step}. Read this whole note, including every \"Held worker message\" section the plugin adds "
         "below while the chat switches.\n"
-        f"{step + 1}. Review the Herdr workers started from this terminal: run `codex context-handoff workers`, "
-        "read each worker's result, then record a decision for every listed worker with `codex context-handoff "
-        "workers decide <id> keep|reuse|close --reason \"...\"` (close only after its result is captured), and "
-        "finish with `codex context-handoff workers done`.\n"
-        f"{step + 2}. Confirm with `codex context-handoff restored --token <token>`, using the last Read token "
+        f"{step + 1}. Review the Herdr workers started from this terminal: run `{helper_command('workers')}`, "
+        f"read each worker's result, then record a decision for every listed worker with `{decide}` (close only "
+        f"after its result is captured), and finish with `{helper_command('workers', 'done')}`.\n"
+        f"{step + 2}. Confirm with `{helper_command('restored', '--token', '<token>')}`, using the last Read token "
         "line in this note.\n"
         f"\nRead token (revision 0): {read_token(secret, 0)}\n"
     )
@@ -2344,8 +2358,8 @@ def continuation(record, state):
     return (
         f"Codex Context Handoff: {record['session']} {record['turn']} {record['nonce']} "
         f"Read the local handoff note at {json.dumps(str(state.with_suffix('.md')))} and follow its restore "
-        "checklist. Check the working tree and live Herdr workers before resuming the remaining work. Preserve "
-        "the user's scope and decisions."
+        "checklist (run its helper commands with exec_command and login: false). Check the working tree and live "
+        "Herdr workers before resuming the remaining work. Preserve the user's scope and decisions."
         + (" A Goal was transferred with this handoff: before anything else, call create_goal with exactly the "
            "objective and token_budget from the note's \"Goal transfer\" section and print its raw result."
            if state.with_suffix(".goal.json").is_file() else "")
@@ -3304,7 +3318,7 @@ def prompt_hook(payload, root, terminal):
     ))
     return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": restore_instruction(
         transfer, "a Goal was transferred with this handoff. Before anything else:"
-    )}}
+    ) + f" After that, follow the note's restore checklist; its helper is {helper_command()}. {SHELL_NOTE}"}}
 
 
 def received_handoff(folder, root):
@@ -3322,9 +3336,9 @@ def restoration_missing(state):
     """What the destination still has to do before the handoff counts as restored."""
     missing = []
     if manifest_entries(state) and not state.with_suffix(".workers-report.json").is_file():
-        missing.append("review the Herdr workers (`codex context-handoff workers`, then `workers decide` for "
+        missing.append(f"review the Herdr workers (`{helper_command('workers')}`, then `workers decide` for "
                        "each and `workers done`)")
-    missing.append("confirm with `codex context-handoff restored --token <the last Read token in the note>`")
+    missing.append(f"confirm with `{helper_command('restored', '--token', '<the last Read token in the note>')}`")
     return missing
 
 
@@ -3340,12 +3354,12 @@ def restoration_check(payload, root, session):
     if new_private_file(folder / ".restore-reminded", utc_now() + "\n"):
         return {"decision": "block", "reason": (
             "Codex Context Handoff: before you finish, complete the handoff's restore checklist (it is at the end of "
-            f"the note {state.with_suffix('.md')}): " + "; ".join(restoration_missing(state)) + "."
+            f"the note {state.with_suffix('.md')}): " + "; ".join(restoration_missing(state)) + f". {SHELL_NOTE}"
         )}
     if new_private_file(folder / ".restore-unconfirmed", utc_now() + "\n"):
         return {"systemMessage": (
             "Context handoff: this chat did not confirm the handoff's restore checklist (note read, worker review). "
-            f"Run `codex context-handoff status` here to see what is missing; the note is {state.with_suffix('.md')}."
+            f"Run `{helper_command('status')}` here to see what is missing; the note is {state.with_suffix('.md')}."
         )}
     return None
 
@@ -3368,7 +3382,7 @@ def end_restoration_wait(payload, root, terminal, judges=None):
     new_private_file(folder / ".restore-unconfirmed", "a prompt arrived first\n")
     return (
         "Context handoff: the restore checklist of the handoff this chat received was not confirmed before this "
-        "prompt; the plugin no longer reminds about it. `codex context-handoff status` shows what is missing."
+        f"prompt; the plugin no longer reminds about it. `{helper_command('status')}` shows what is missing."
     )
 
 
@@ -3382,7 +3396,9 @@ def helper_context(root, need_goal=True):
     session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SESSION_ID") or ""
     terminal = os.environ.get("HC_TERMINAL_ID", "")
     if not ID.fullmatch(session):
-        raise Refusal("CODEX_THREAD_ID is missing; run this from a tool call in the Codex chat")
+        raise Refusal(f"CODEX_THREAD_ID is missing; run this from a tool call in the Codex chat. {SHELL_NOTE}")
+    if not TERMINAL.fullmatch(terminal):
+        raise Refusal(f"HC_TERMINAL_ID is missing. {SHELL_NOTE}")
     transcript = find_transcript(session)
     if not transcript:
         raise Refusal(f"no transcript was found for chat {session}")
