@@ -20,13 +20,13 @@ from test_context_handoff import (
 # Shared helpers only: the class itself is not bound here, so its tests run once, in their own module.
 shared = test_context_handoff.ContextHandoffTests.__dict__
 
-# The exact shape of a Herdr worker report as Codex 0.167.2 records it in a live chat, with the body
-# shortened: a response_item user message with provenance "user" and its UserMessage event.
-REPORT_TEXT = ('<hc from="t2c perf-review">R1-B static review written: '
-                  'notes/review.md (78 lines). Holding.</hc>')
+# The shape of a Herdr worker report as Codex 0.167.2 records it in a live chat, with a synthetic
+# body: a response_item user message with provenance "user" and its UserMessage event.
+REPORT_TEXT = ('<hc from="t2c perf-review">Sample fixture report: example step done, '
+                  'output in out/sample.txt.</hc>')
 
 
-def report_rows(text=REPORT_TEXT, ident="01a1dd42"):
+def report_rows(text=REPORT_TEXT, ident="fixture-1"):
     return [
         {"type": "response_item", "payload": {
             "type": "message", "id": f"msg_{ident}", "role": "user",
