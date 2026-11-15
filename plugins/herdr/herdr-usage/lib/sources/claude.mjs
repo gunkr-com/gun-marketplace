@@ -19,18 +19,33 @@ export function claudeCredentialPath(settingsPath) {
   return path.join(dir, ".credentials.json");
 }
 
+const KEYCHAIN_SERVICE = "Claude Code-credentials";
+const FALLBACK_ACCOUNT = "claude-code-user";
+
+// The Keychain account Claude Code writes its login under: the current user
+// name ($USER, else the OS user name), or a fixed fallback when that is
+// missing or has characters outside [a-zA-Z0-9._-].
+export function keychainAccount({ env = process.env, userInfo = os.userInfo } = {}) {
+  let name = env.USER;
+  if (!name) { try { name = userInfo().username; } catch { name = ""; } }
+  return name && /^[a-zA-Z0-9._-]+$/.test(name) ? name : FALLBACK_ACCOUNT;
+}
+
 // Claude Code on macOS uses Keychain; a leftover credential file may be expired.
 // Read the current login each poll, without copying or rotating Keychain secrets.
-async function readKeychain() {
+// Select the entry by service *and* account, as Claude Code does: a
+// service-only lookup returns whichever duplicate entry comes first, which
+// can be an old one without a token.
+export async function readKeychain({ run = promisify(execFile), account = keychainAccount() } = {}) {
   try {
-    const { stdout } = await promisify(execFile)("/usr/bin/security",
-      ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+    const { stdout } = await run("/usr/bin/security",
+      ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"],
       { timeout: 5000, maxBuffer: 64 * 1024 });
     return JSON.parse(stdout)?.claudeAiOauth ?? null;
   } catch { return null; }
 }
 
-export async function claudeLogin(file, { platform = process.platform, keychain = readKeychain } = {}) {
+export async function claudeLogin(file, { platform = process.platform, keychain = () => readKeychain() } = {}) {
   // Custom config folders must never silently use another account's default login.
   if (platform === "darwin" && path.dirname(file) === path.join(os.homedir(), ".claude")) {
     const oauth = await keychain();
