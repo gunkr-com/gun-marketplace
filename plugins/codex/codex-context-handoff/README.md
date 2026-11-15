@@ -149,6 +149,15 @@ A chat that still runs the 0.5.0 hooks writes its note and starts a 0.5.0 switch
 
 Before the receipt, the plugin adds the restore checklist to the end of the note, with a new read token that appears only there. With a Goal, the first step is the exact `create_goal`. The fresh chat is told to recreate the Goal first and then follow the note's checklist. 0.5.0 recorded no worker manifest, so the first `codex context-handoff workers` (after the Goal is recreated) takes it from Herdr's current list; `restored` is refused until that review is done. While a 0.5.0 switch is pending, a worker message cancels the handoff as in 0.5.0 instead of being held, because that switch cannot retry. A 0.5.0 handoff whose fresh chat still runs 0.5.0 hooks stays entirely 0.5.0.
 
+A live check with Codex CLI 0.169.0 and Herdr 0.1.21 covered this path: an unchanged 0.5.0 hook ran the source chat and its switch, and a 0.6.1 hook received the handoff in the fresh chat. A test harness chose which hook script ran, switching from 0.5.0 to 0.6.1 during the cancellation window. In that check:
+
+- the Goal was recreated exactly, with `create_goal` as the first tool call;
+- the checklist with its read token was added to the note, and the restore was confirmed;
+- the worker manifest was taken at the first `workers` call, and the worker review finished;
+- `/clear` was typed once.
+
+The check does not show whether Codex itself loads newly installed hooks at `/clear` or only after a restart.
+
 ## Herdr workers (0.6.0)
 
 Before the cancellation window the switch saves a manifest, `<state>.workers.json`: every live descendant of the terminal (nested workers included) and the descendants that finished during the old chat (newest 20), with address, parent, name, labels, working directory, program and pid, status, and a result location from a `result`, `report` or `output` label. Terminals the terminal did not start, its parent and siblings are never listed.
