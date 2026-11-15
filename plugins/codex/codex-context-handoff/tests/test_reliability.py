@@ -266,7 +266,7 @@ class FooterTests(Base):
     armed = shared["armed"]
     faked = shared["faked"]
 
-    STATUS = "\n\n  gpt-5.5 high · 40% context left · ~/Library/CloudStorage/My\n  Drive/projects/app\n  ? for shortcuts"
+    STATUS = "\n\n  gpt-5.5 high · 40% context left · ~/Documents/Long Folder/My\n  Drive/projects/app\n  ? for shortcuts"
 
     def test_wrapped_footer_in_a_narrow_terminal_is_an_empty_prompt(self):
         wrapped_old = "› fix the bug\n• Fixed most of it.\n\n› Ask Codex to do anything" + self.STATUS
@@ -303,7 +303,7 @@ class FooterTests(Base):
                     self.assertIsNone(handoff.read_composer("t1"))
                 self.assertNotEqual(handoff.prompt_state(screen, OLD), "fresh")
         # A blank line made of spaces beneath the placeholder is still the status gap.
-        spaced = "› Ask Codex to do anything\n   \n  gpt-5.5 · ~/Library/CloudStorage/My\n  Drive/x\n  ? for shortcuts"
+        spaced = "› Ask Codex to do anything\n   \n  gpt-5.5 · ~/Documents/Long Folder/My\n  Drive/x\n  ? for shortcuts"
         self.assertEqual(handoff.composer_text(spaced), "")
 
 
