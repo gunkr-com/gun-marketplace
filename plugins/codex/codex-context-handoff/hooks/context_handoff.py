@@ -50,9 +50,12 @@ CLEAR_ECHO = 3.0  # seconds after /clear in which the old status and screen may 
 # Seconds after /clear, before the first fresh prompt, in which a working Codex may show no prompt in the
 # footer: it is still drawing the fresh chat, or a prompt Herdr submitted during startup waits for its hook.
 STARTUP_GRACE = 5.0
-# How long a turn that started in the fresh chat without any content may wait for its UserPromptSubmit
-# hook (Codex runs the hook only after the first turn's setup, ~1.5 s in live QA, more with slow MCP servers).
+# How long a turn that started in the fresh chat without any content may wait for its UserPromptSubmit hook
+# when nothing proves the hook runs in this Codex, or in the recheck right before the continuation. Codex runs
+# the hook only after the first turn's setup (~1.5 s in live QA, 20 s and more with slow MCP servers), so with
+# that proof and Codex working, such a turn shares the startup wait's own deadline instead.
 PENDING_TURN_WAIT = 10.0
+TURN_FLUSH = 1.0  # after a held message is recorded, how long Codex may take to write its turn's task_complete
 SETTLE = 2.0  # seconds the fresh chat must stay idle with an empty prompt before the continuation
 # Submitted as the whole prompt, this reaches the model and arms a handoff (and a Goal transfer) right away.
 NOW = {"handoff now", "핸드오프 지금"}
@@ -2431,7 +2434,9 @@ def held_seen(state):
 
 QUIET_EVENTS = {"task_started", "task_complete", "turn_aborted", "thread_settings_applied"}
 FRESH_CONTENT = "Content that no held worker message explains reached the fresh chat"
-PENDING_LATE = f"A turn in the fresh chat did not finish within {PENDING_TURN_WAIT:g}s"
+
+
+PENDING_LATE = "A turn in the fresh chat stayed open past its deadline without its prompt hook deciding"
 
 
 def turn_context_row(item):
@@ -2512,29 +2517,39 @@ def may_be_held(problem):
     ))
 
 
-def settle_change(state, record, held_base, phase, final, turns=None):
+def settle_change(state, record, held_base, phase, final, turns=None, deadline=None):
     """The screen or Herdr turn changed: give the UserPromptSubmit hook a moment to record why.
 
     A worker message it held makes the change retryable; a cancellation (a person's prompt or `handoff
     off`) or no explanation at all is final. `turns` (after /clear) reads the fresh chat's turns: while
     one has started without content its hook has not decided yet, so the wait (and the armed guard)
-    lasts up to PENDING_TURN_WAIT, and a retry starts only once that turn has finished; content that
-    no held message explains is final at once.
+    lasts until `deadline` (the startup wait's own, when the caller has proof the hook runs there and
+    Codex is working; else PENDING_TURN_WAIT from now), and a retry starts only once that turn has
+    finished. A message held right at that deadline gets TURN_FLUSH for Codex to write the turn's end,
+    with no new budget. Content that no held message explains is final at once.
     """
     start = time.monotonic()
+    deadline = deadline if deadline is not None else start + PENDING_TURN_WAIT
+    held_at = None
     while True:
         if stopped(state):
             raise RuntimeError("Handoff was cancelled (a prompt was submitted or the handoff was turned off).")
+        now = time.monotonic()
         verdict = turns() if turns else "none"
         if verdict == "moved":
             raise RuntimeError(f"{FRESH_CONTENT}. {final}")
-        waiting = verdict == "pending" and time.monotonic() - start < PENDING_TURN_WAIT
-        if held_seen(state) > held_base and not waiting:
-            if verdict == "pending":
-                raise RuntimeError(f"{PENDING_LATE}. {final}")
+        held = held_seen(state) > held_base
+        if held and held_at is None:
+            held_at = now
+        if verdict == "pending":
+            if now < deadline or (held_at is not None and now < held_at + TURN_FLUSH):
+                time.sleep(POLL)
+                continue
+            raise RuntimeError(f"{PENDING_LATE}. {final}")
+        if held:
             raise Retryable("A Herdr worker message arrived and was held for the fresh chat.", phase)
-        if time.monotonic() - start >= INPUT_SETTLE and not waiting:
-            raise RuntimeError(f"{PENDING_LATE}. {final}" if verdict == "pending" else final)
+        if now - start >= INPUT_SETTLE:
+            raise RuntimeError(final)
         time.sleep(POLL)
 
 
@@ -2698,7 +2713,7 @@ def draft_above_footer(screen, old_screen):
 
 
 def fresh_chat_problem(view, state, record, old_screen, cleared_turn, echo, cache, history_ok=False,
-                       startup=False, since=None):
+                       startup=False, since=None, deadline=None):
     """Why the switch must stop now, or None while the fresh chat may still be starting.
 
     Codex reports `working` while MCP servers start after /clear, with the fresh, empty prompt
@@ -2707,8 +2722,9 @@ def fresh_chat_problem(view, state, record, old_screen, cleared_turn, echo, cach
     `startup` covers the first seconds before any fresh prompt showed: a footerless frame while
     working is not final yet, because a worker message Herdr submits during startup draws over the
     footer before its UserPromptSubmit hook holds it. `since` (just before /clear) lets the fresh chat's
-    rollout speak too: a turn that started there without content is waited for (PENDING_TURN_WAIT, also
-    after the first fresh prompt), and content no held message explains is final. The guard stays armed
+    rollout speak too: a turn that started there without content is waited for, also after the first
+    fresh prompt: until `deadline` (the startup wait's, passed only with proof that the prompt hook runs in
+    this Codex) while Codex is working, else PENDING_TURN_WAIT. Content no held message explains is final. The guard stays armed
     all the while, so a person's prompt still cancels and a draft is still final at once; the
     continuation still needs the fresh placeholder to settle (`cache["turns"]` blocks settling).
     """
@@ -2726,15 +2742,20 @@ def fresh_chat_problem(view, state, record, old_screen, cleared_turn, echo, cach
     turns = cache["turns"] = fresh_chat_turns(record, state, since) if since is not None else "none"
     if turns == "moved":
         return FRESH_CONTENT
-    if turns == "pending":
-        cache.setdefault("pending_since", time.monotonic())
-        if time.monotonic() - cache["pending_since"] >= PENDING_TURN_WAIT:
-            return PENDING_LATE
-    else:
+    if turns != "pending":
         cache.pop("pending_since", None)
     if view is None:
         return "The terminal no longer runs the original Codex in this worktree"
     status, turn, since, screen = view
+    if turns == "pending":
+        now = time.monotonic()
+        opened = cache.setdefault("pending_since", now)
+        until = cache["pending_until"] = (
+            deadline if deadline is not None and status == "working" else opened + PENDING_TURN_WAIT
+        )
+        if now >= until:
+            # Not final yet: a message held right now gets TURN_FLUSH in settle_change, no more.
+            return f"A prompt is starting in the fresh chat; {PENDING_LATE[0].lower()}{PENDING_LATE[1:]}"
     if type(turn) is not int or type(since) is not int:
         return "Herdr did not report the turn counter and status time"
     # Herdr's turn goes up each time the status leaves working: startup may end once.
@@ -2786,6 +2807,9 @@ def await_fresh_chat(record, state, old_screen, cleared_turn, cache, rebased=Fal
     evidence = prompt_hook_evidence(state, record)
     # Without proof that the takeover hook runs in this process, a long busy startup is not trusted.
     limit = startup_wait() if evidence else 12.0
+    # One deadline for this wait: a pending fresh-chat turn (proof that the hook runs here, Codex working)
+    # may use what is left of it, never more.
+    deadline = start + limit if evidence else None
     log(f"waiting up to {limit:g}s for the fresh chat (prompt hook evidence: {'yes' if evidence else 'no'}"
         + (", same fresh chat as the previous attempt" if rebased else "") + ")")
     settled = shown = None
@@ -2803,12 +2827,17 @@ def await_fresh_chat(record, state, old_screen, cleared_turn, cache, rebased=Fal
         echo = echo and elapsed < CLEAR_ECHO and not fresh
         startup = startup and elapsed < STARTUP_GRACE and not fresh
         problem = fresh_chat_problem(view, state, record, old_screen, cleared_turn, echo, cache, history_ok, startup,
-                                     since)
+                                     since, deadline)
         if problem:
             message = f"{problem} {elapsed:.1f}s after /clear ({summary})."
             if not may_be_held(problem):
                 raise RuntimeError(message)
-            settle_change(state, record, held_base, "post-clear", message, fresh_turns(record, state, since))
+            # A pending turn keeps its own deadline (no new budget); otherwise the startup wait's, while working.
+            if cache.get("turns") == "pending":
+                until = cache.get("pending_until")
+            else:
+                until = deadline if view is not None and view[0] == "working" else None
+            settle_change(state, record, held_base, "post-clear", message, fresh_turns(record, state, since), until)
         pending = cache.get("turns") == "pending"  # a prompt is on its way to its hook: never settle meanwhile
         if (view[0] == "idle" or (history_ok and view[0] == "done")) and fresh and not pending:
             if settled is None or settled[0] != view[1:]:
@@ -2820,7 +2849,8 @@ def await_fresh_chat(record, state, old_screen, cleared_turn, cache, rebased=Fal
             settled = None
         if elapsed >= limit:
             message = f"The fresh chat did not settle at an idle prompt within {limit:g}s after /clear ({summary})."
-            if view[0] in {"working", "idle"} and view[3] is not None and composer_text(view[3]) == "":
+            # Never retried while a fresh-chat turn is still open: its prompt could still land.
+            if view[0] in {"working", "idle"} and view[3] is not None and composer_text(view[3]) == "" and not pending:
                 raise Retryable(message, "post-clear")
             raise RuntimeError(message)
         time.sleep(POLL)

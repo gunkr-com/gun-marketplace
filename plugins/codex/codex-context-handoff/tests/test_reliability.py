@@ -1296,16 +1296,62 @@ class FreshRolloutTests(PostClearStartupTests):
         self.assertEqual([a.get("phase") for a in self.ledger()["attempts"]], [None, "post-clear"])
         self.assertEqual(len([s for s in self.sends if s.startswith("Codex Context Handoff:")]), 1)
 
-    def test_a_turn_that_never_reaches_its_hook_is_bounded_with_the_guard_armed(self):
+    def armed_at(self, *times):
         armed = []
-        self.queued_worker(None, steps=[(t, lambda: armed.append(handoff.guard_armed(self.state, self.record)))
-                                        for t in (3, 6, 9)])
-        with self.assertRaisesRegex(RuntimeError, "did not finish within 10s"):
+        return armed, [(t, lambda: armed.append(handoff.guard_armed(self.state, self.record))) for t in times]
+
+    def test_a_20s_mcp_startup_before_the_hook_is_waited_for_with_proof(self):
+        # The supported slow startup: Codex submits the queued worker message but runs its hook 20 s later.
+        armed, checks = self.armed_at(5, 12, 19)
+        self.queued_worker(None, steps=[*checks, (20.6, self.blocked)])
+        self.run_switch()
+        self.assertEqual(armed, [True, True, True])
+        self.assertEqual(self.state.with_suffix(".received").read_text(), "fresh\n")
+        self.assertEqual(len(self.keys), 1)
+        self.assertEqual([a.get("phase") for a in self.ledger()["attempts"]], [None, "post-clear"])
+        self.assertEqual(len([s for s in self.sends if s.startswith("Codex Context Handoff:")]), 1)
+
+    def test_a_pending_turn_ends_with_the_startup_wait_not_before(self):
+        armed, checks = self.armed_at(10, 20, 29.5)
+        self.queued_worker(None, steps=checks)
+        with patch.object(handoff, "startup_wait", return_value=30.0), \
+                self.assertRaisesRegex(RuntimeError, "stayed open past its deadline"):
             self.run_switch()
         self.assertEqual(armed, [True, True, True])
-        self.assertGreaterEqual(self.failed_at, 0.6 + handoff.PENDING_TURN_WAIT)
-        self.assertLess(self.failed_at, 0.6 + handoff.PENDING_TURN_WAIT + 1)
+        self.assertGreaterEqual(self.failed_at, 30.0)
+        self.assertLess(self.failed_at, 30.5)  # the same deadline: no settle time added on top
+        self.assertEqual(len(self.ledger()["attempts"]), 1)  # never retried while a turn is open
         self.assertEqual([s for s in self.sends if s.startswith("Codex Context Handoff:")], [])
+
+    def test_without_proof_a_pending_turn_waits_only_the_short_bound(self):
+        (self.root / "session" / ".prompt-hook").unlink()
+        self.queued_worker(None, steps=[(999, lambda: None)])  # the hook never decides
+        with self.assertRaisesRegex(RuntimeError, "stayed open past its deadline"):
+            self.run_switch()
+        self.assertGreaterEqual(self.failed_at, 0.6 + handoff.PENDING_TURN_WAIT)
+        self.assertLess(self.failed_at, 0.6 + handoff.PENDING_TURN_WAIT + 0.5)
+
+    def test_a_message_held_right_at_the_deadline_gets_its_turn_flushed(self):
+        def held():
+            self.assertIn("held", self.hold("f1", session="fresh"))  # 0.1 s before the deadline
+        def flushed():
+            self.fresh_rows(event("task_complete", turn_id="f1", last_agent_message=None))
+        def shown():
+            self.term.set(screen=HELD_FRESH, status="done", turn=6)
+        self.queued_worker(None, steps=[(19.9, held), (20.5, flushed), (20.6, shown)])
+        with patch.object(handoff, "startup_wait", return_value=20.0):
+            self.run_switch()
+        self.assertEqual(self.state.with_suffix(".received").read_text(), "fresh\n")
+        self.assertEqual([a.get("phase") for a in self.ledger()["attempts"]], [None, "post-clear"])
+
+    def test_the_flush_grace_is_short_and_needs_a_held_message(self):
+        def held():
+            self.assertIn("held", self.hold("f1", session="fresh"))
+        self.queued_worker(None, steps=[(19.9, held)])  # task_complete never written
+        with patch.object(handoff, "startup_wait", return_value=20.0), \
+                self.assertRaisesRegex(RuntimeError, "stayed open past its deadline"):
+            self.run_switch()
+        self.assertLess(self.failed_at, 19.9 + handoff.TURN_FLUSH + 0.5)
 
     def test_unheld_content_in_the_fresh_chat_is_final(self):
         def answered():
