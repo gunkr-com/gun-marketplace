@@ -45,7 +45,7 @@ In a Claude Code session the same commands are `/plugin marketplace add gunkr-co
 
 ### Codex plugins
 
-[Codex Context Handoff](plugins/codex/codex-context-handoff) starts a fresh Codex chat in the same Herdr terminal when the active context exceeds 40% and work remains. Existing Herdr workers keep their parent terminal.
+[Codex Context Handoff](plugins/codex/codex-context-handoff) starts a fresh Codex chat in the same Herdr terminal when the active context exceeds 40% and work remains. Existing Herdr workers keep their parent terminal; the fresh chat reviews them and confirms it read the handoff note. Worker messages that arrive during the switch are kept for the fresh chat instead of cancelling it, and a failed switch is retried a bounded number of times and reported.
 
 ```bash
 codex plugin marketplace add gunkr-com/gun-marketplace
@@ -117,7 +117,7 @@ Claude Code 세션 안에서는 같은 명령을 `/plugin marketplace add gunkr-
 
 ### Codex 플러그인
 
-[Codex Context Handoff](plugins/codex/codex-context-handoff)는 컨텍스트 사용량이 40%를 넘고 할 일이 남아 있으면 같은 Herdr 터미널의 새 Codex 대화에서 이어갑니다. 실행 중인 Herdr 워커는 기존 부모 터미널에 연결된 상태로 유지됩니다.
+[Codex Context Handoff](plugins/codex/codex-context-handoff)는 컨텍스트 사용량이 40%를 넘고 할 일이 남아 있으면 같은 Herdr 터미널의 새 Codex 대화에서 이어갑니다. 실행 중인 Herdr 워커는 기존 부모 터미널에 연결된 상태로 유지되고, 새 대화가 워커를 검토하고 인계 노트를 읽었음을 확인합니다. 전환 중에 도착한 워커 메시지는 인계를 취소하지 않고 새 대화로 넘어가며, 실패한 전환은 정해진 횟수만큼 다시 시도한 뒤 결과를 알립니다.
 
 ```bash
 codex plugin marketplace add gunkr-com/gun-marketplace
