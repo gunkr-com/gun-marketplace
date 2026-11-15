@@ -11,7 +11,7 @@ codex plugin marketplace add gunkr-com/gun-marketplace
 codex plugin add codex-context-handoff@gun-marketplace
 ```
 
-Open a new Codex CLI session. Review the plugin's `Stop`, `PreToolUse`, `PostToolUse`, and `UserPromptSubmit` hooks in `/hooks` before trusting them. A plugin update that changes the hooks must be trusted again; 0.4.0 adds `PreToolUse`, and until it is trusted the tool-call gate below does not run. Trust 0.6.0 again after updating.
+Open a new Codex CLI session. Review the plugin's `Stop`, `PreToolUse`, `PostToolUse`, and `UserPromptSubmit` hooks in `/hooks` before trusting them. A plugin update that changes the hooks must be trusted again; 0.4.0 adds `PreToolUse`, and until it is trusted the tool-call gate below does not run. Trust 0.6.1 again after updating.
 
 Install changes as a new plugin version and trust its hooks again. Do not edit the installed copy under `~/.codex/plugins/cache/`: Codex then treats the plugin as changed ("hook approval required") and skips its hooks until they are trusted again, so a handoff can lose its note silently (its `Stop` hook never runs). A chat keeps the hooks it loaded at start; new behavior applies to chats started (or resumed) after the update is installed and trusted.
 
@@ -142,6 +142,12 @@ The note ends with a checklist and a read token that appears only in the note fi
 4. Run `codex context-handoff restored --token <the last Read token in the note>`. A token from before a held message was added is refused, so the fresh chat must read the final note. No message is held after the receipt, so the note is final by then.
 
 The fresh chat's `Stop` hook reminds once if the restore is not confirmed, then reports once. Your own prompt in the fresh chat ends the reminder; a worker message or a `handoff` control does not. `codex context-handoff status` shows the stages, attempts and what is missing.
+
+## Handoffs from 0.5.0 (0.6.1)
+
+A chat that still runs the 0.5.0 hooks writes its note and starts a 0.5.0 switch, which sends the 0.5.0 continuation. If the fresh chat already runs these hooks, it receives that handoff instead of refusing it as mixed text. It does so only when the handoff's own files prove a 0.5.0 handoff (no restore file, worker manifest or attempt ledger, and the 0.5.0 switch's first log line for this terminal and process), and only for the exact 0.5.0 continuation. Every other check still applies: nonce, terminal, worktree, a fresh chat, Goal transfer still on, and no cancellation. Any other text is refused as mixed, and a repeat is refused as already delivered without cancelling the handoff that arrived.
+
+Before the receipt, the plugin adds the restore checklist to the end of the note, with a new read token that appears only there. With a Goal, the first step is the exact `create_goal`. The fresh chat is told to recreate the Goal first and then follow the note's checklist. 0.5.0 recorded no worker manifest, so the first `codex context-handoff workers` (after the Goal is recreated) takes it from Herdr's current list; `restored` is refused until that review is done. While a 0.5.0 switch is pending, a worker message cancels the handoff as in 0.5.0 instead of being held, because that switch cannot retry. A 0.5.0 handoff whose fresh chat still runs 0.5.0 hooks stays entirely 0.5.0.
 
 ## Herdr workers (0.6.0)
 

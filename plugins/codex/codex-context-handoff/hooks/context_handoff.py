@@ -2375,6 +2375,88 @@ def continuation(record, state):
     )
 
 
+LEGACY_SWITCH_LINE = re.compile(r"\A\d{2}:\d{2}:\d{2} switch for (t[0-9a-z]+) \(pid (\d+)\) started at Herdr turn (?:\d+|None)\Z")
+LEGACY_FROM = "0.5.0"
+
+
+def legacy_state(state, record):
+    """Whether this pending handoff was captured by the 0.5.0 hooks and is switched by a 0.5.0 process.
+
+    0.5.0 writes the same record, note, Goal transfer and guard, but no restore file, worker manifest or
+    ledger (0.6 writes the ledger when it arms and `.restore.json` when it captures), and its switch logs
+    `... started at Herdr turn N` first (0.6: `... at Herdr turn N`). All of it is required.
+    """
+    if not isinstance(record, dict) or not all(isinstance(record.get(k), str) for k in ("session", "turn", "nonce", "terminal", "cwd")):
+        return False
+    if type(record.get("pid")) is not int or record["pid"] <= 0 or not state.with_suffix(".md").is_file():
+        return False
+    if any(state.with_suffix(s).exists() for s in (".restore.json", ".workers.json", ".attempts.json")):
+        return False
+    try:
+        with state.with_suffix(".log").open(encoding="utf-8") as stream:
+            first = stream.readline(512).rstrip("\n")
+    except OSError:
+        return False
+    match = LEGACY_SWITCH_LINE.fullmatch(first)
+    return bool(match) and match.group(1) == record["terminal"] and match.group(2) == str(record["pid"])
+
+
+def legacy_continuation(record, state):
+    """The 0.5.0 continuation, verbatim: what a 0.5.0 switch sends to the fresh chat."""
+    return (
+        f"Codex Context Handoff: {record['session']} {record['turn']} {record['nonce']} "
+        f"Read the local handoff note at {json.dumps(str(state.with_suffix('.md')))}. Check the working "
+        "tree and live Herdr workers before resuming the remaining work. Preserve the user's scope and "
+        "decisions."
+        + (" A Goal was transferred with this handoff: before anything else, call create_goal with exactly the "
+           "objective and token_budget from the note's \"Goal transfer\" section and print its raw result."
+           if state.with_suffix(".goal.json").is_file() else "")
+    )
+
+
+def destination_files(state, folder, source, turn, transfer):
+    """The receiving chat's own records: where its handoff came from and, with a Goal, what to recreate.
+    Never overwritten: a second call keeps the first."""
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    new_private_file(folder / ".received-from", f"{source} {turn}\n")
+    if not transfer:
+        return
+    # This chat's hooks confirm once that the Goal was recreated exactly (restore_check, confirm_restore).
+    new_private_file(folder / ".goal-restore", json.dumps({
+        "state": str(state), "source_session": transfer["source_session"], "objective": transfer["objective"],
+        "objective_sha256": transfer["objective_sha256"], "remaining": transfer["remaining"],
+    }, ensure_ascii=False))
+    replace_private(folder / ".goal-lineage.json", json.dumps(
+        dict(transfer["lineage"], objective_sha256=transfer["objective_sha256"])
+    ))
+
+
+def bootstrap_legacy(state, destination, transfer, folder, source, turn):
+    """Prepare a 0.5.0 handoff for the 0.6 restore, under the note lock and before its receipt: the marker,
+    a secret, the restore checklist at the end of the note (its first step is the exact create_goal; its read
+    token appears only there), and the receiving chat's records. Repeatable after a partial failure; the
+    worker manifest follows at the first `workers` helper, which, like every helper, refuses until the Goal
+    is recreated."""
+    new_private_file(state.with_suffix(".legacy.json"), json.dumps({"from": LEGACY_FROM, "chat": destination, "at": utc_now()}))
+    secret = (read_json(state.with_suffix(".restore.json")) or {}).get("secret")
+    if not secret:
+        secret = secrets.token_hex(16)
+        if not new_private_file(state.with_suffix(".restore.json"), json.dumps({"secret": secret})):
+            raise OSError("the restore file exists but holds no secret")
+    note = state.with_suffix(".md")
+    if "\n## Restore checklist (Codex Context Handoff)\n" not in note.read_text(encoding="utf-8"):
+        with note.open("a", encoding="utf-8") as stream:
+            stream.write("\nThis handoff was written by Codex Context Handoff 0.5.0; the plugin added the checklist "
+                         "below when it arrived.\n" + restore_checklist(state, secret, transfer))
+            stream.flush()
+            os.fsync(stream.fileno())
+    destination_files(state, folder, source, turn, transfer)
+
+
+def is_legacy(state):
+    return state.with_suffix(".legacy.json").is_file()
+
+
 def herdr_turn(info):
     turn = info.get("turn") if info else None
     if type(turn) is not int:
@@ -3466,7 +3548,8 @@ def mark_takeover(payload, root, terminal):
         record = json.loads(state.read_text(encoding="utf-8"))
         if record["nonce"] != nonce or record["terminal"] != terminal:
             return None, None
-        expected = continuation(record, state)
+        legacy = is_legacy(state) or legacy_state(state, record)
+        expected = legacy_continuation(record, state) if legacy else continuation(record, state)
     except (OSError, ValueError, KeyError, TypeError):
         return None, None  # no armed guard; the switch itself fails closed without one
     if any(state.with_suffix(suffix).exists() for suffix in DONE):
@@ -3474,7 +3557,9 @@ def mark_takeover(payload, root, terminal):
     prompt = (payload.get("prompt") or "").strip()
     if prompt == expected:
         return None, None
-    if prompt.startswith("<hc") and state.with_suffix(".md").is_file():
+    # A 0.5.0 switch cannot retry after a held message, so under it a worker message cancels as in 0.5.0
+    # and reaches the chat with the notice instead of waiting in a note nobody will read.
+    if prompt.startswith("<hc") and state.with_suffix(".md").is_file() and not legacy:
         held = hold_worker_message(state, record, payload, prompt, terminal)
         if held == "pass":
             return None, None
@@ -3511,7 +3596,13 @@ def prompt_hook(payload, root, terminal):
     if nonce != record["nonce"] or terminal != record["terminal"]:
         return {}
     manual = f" Read the handoff note at {note} yourself if the work should continue."
-    if text != continuation(record, state):
+    # A 0.5.0 handoff (proven by its own files and switch log, or by the marker its delivery left) arrives
+    # with the 0.5.0 text, exactly.
+    legacy = text == legacy_continuation(record, state) and (is_legacy(state) or legacy_state(state, record))
+    if not legacy and text != continuation(record, state):
+        if state.with_suffix(".received").exists():
+            # Never cancel a handoff that a chat already received; its restore continues there.
+            return {"decision": "block", "reason": "This handoff has already been delivered."}
         # A draft or another message got mixed in; never run it as a handoff.
         new_private_file(
             state.with_suffix(".cancelled"), "the continuation arrived mixed with other text\n" + goal_paused_line(state)
@@ -3538,26 +3629,34 @@ def prompt_hook(payload, root, terminal):
         transfer = json.loads(state.with_suffix(".goal.json").read_text(encoding="utf-8"))
     # Under the note lock: no worker message is held after the receipt, so the note (and its last read
     # token) is final from here on, and later worker messages reach this chat directly.
+    folder = root / destination
     with open_lock(state.with_suffix(".note-lock")):
+        if state.with_suffix(".received").exists():
+            return {"decision": "block", "reason": "This handoff has already been delivered."}
+        if legacy:
+            # Everything the restore needs exists before the receipt tells the 0.5.0 switch it arrived.
+            try:
+                bootstrap_legacy(state, destination, transfer, folder, source, turn)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                return {"decision": "block", "reason": (
+                    f"The handoff from version 0.5.0 could not be prepared in this chat ({type(error).__name__}: "
+                    f"{error}), so it was not run." + manual
+                )}
         if not new_private_file(state.with_suffix(".received"), destination + "\n"):
             return {"decision": "block", "reason": "This handoff has already been delivered."}
         disarm_guard(state, record)
-    set_stage(state, "delivered", chat=destination, held=held_count(state))
+    set_stage(state, "delivered", chat=destination, held=held_count(state), **({"legacy": LEGACY_FROM} if legacy else {}))
     # The receiving turn is checked like any other; its headroom is measured from this chat's first
     # request (baseline), so a note that starts past the threshold cannot hand off again at once.
-    folder = root / destination
-    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-    new_private_file(folder / ".received-from", f"{source} {turn}\n")
+    destination_files(state, folder, source, turn, transfer)
     if not transfer:
+        if legacy:  # the 0.5.0 text does not mention the checklist the plugin added to the note (no token here)
+            return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": (
+                "Codex Context Handoff: this handoff came from version 0.5.0; the plugin added a restore checklist "
+                f"at the end of the note {note}. Read the whole note and follow that checklist; its helper is "
+                f"{helper_command()}. {SHELL_NOTE}"
+            )}}
         return {}
-    # This chat's hooks confirm once that the Goal was recreated exactly (restore_check, confirm_restore).
-    new_private_file(folder / ".goal-restore", json.dumps({
-        "state": str(state), "source_session": transfer["source_session"], "objective": transfer["objective"],
-        "objective_sha256": transfer["objective_sha256"], "remaining": transfer["remaining"],
-    }, ensure_ascii=False))
-    replace_private(folder / ".goal-lineage.json", json.dumps(
-        dict(transfer["lineage"], objective_sha256=transfer["objective_sha256"])
-    ))
     return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": restore_instruction(
         transfer, "a Goal was transferred with this handoff. Before anything else:"
     ) + f" After that, follow the note's restore checklist; its helper is {helper_command()}. {SHELL_NOTE}"}}
@@ -3577,7 +3676,9 @@ def received_handoff(folder, root):
 def restoration_missing(state):
     """What the destination still has to do before the handoff counts as restored."""
     missing = []
-    if manifest_entries(state) and not state.with_suffix(".workers-report.json").is_file():
+    # A 0.5.0 handoff gets its manifest at the first `workers` helper: until then the review is still due.
+    unlisted = is_legacy(state) and not state.with_suffix(".workers.json").is_file()
+    if (unlisted or manifest_entries(state)) and not state.with_suffix(".workers-report.json").is_file():
         missing.append(f"review the Herdr workers (`{helper_command('workers')}`, then `workers decide` for "
                        "each and `workers done`)")
     missing.append(f"confirm with `{helper_command('restored', '--token', '<the last Read token in the note>')}`")
@@ -3713,6 +3814,15 @@ def capture_evidence(state, address, label, strict=False):
 def workers_inspect(ctx):
     state, terminal = ctx["state"], ctx["terminal"]
     manifest = read_json(state.with_suffix(".workers.json"))
+    if manifest is None and is_legacy(state):
+        # 0.5.0 recorded no manifest: take it now, once, after the Goal was recreated (helper_context).
+        try:
+            with open_lock(state.with_suffix(".workers-lock")):
+                if not state.with_suffix(".workers.json").is_file():
+                    capture_manifest(ctx["record"], state, False)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            raise Refusal(f"Herdr could not be read for the worker manifest ({type(error).__name__})") from None
+        manifest = read_json(state.with_suffix(".workers.json"))
     if manifest is None:
         raise Refusal("this handoff has no worker manifest (the switch could not record one)")
     try:
