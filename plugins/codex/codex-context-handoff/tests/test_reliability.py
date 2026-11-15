@@ -1121,6 +1121,225 @@ class CoreReviewTests(SwitchTests):
             self.assertTrue(handoff.reconcile_receipt(self.record, self.state, OLD, 6, 0, False))
 
 
+# Codex while it starts the fresh chat (or runs a just-submitted prompt) can show no prompt in the footer.
+NO_FOOTER = "╭ Starting MCP servers ╮\n│ codex_apps │\n╰──────────────────────╯\n\n  Working (0s • esc to interrupt)\n"
+BLANK = "\n\n  \n"
+
+
+@own_tests_only
+class PostClearStartupTests(BlockedTurnTests):
+    """Live Goal-02: a worker message Herdr submits while the fresh chat starts draws over the footer
+    before its UserPromptSubmit hook holds it; that startup frame is not a final failure."""
+
+    def run_switch(self):
+        """Also records when the switch failed (before its notice waits for an idle prompt)."""
+        original = handoff.report_failure
+        def failed(*args):
+            self.failed_at = self.clock.now - self.cleared_at
+            return original(*args)
+        with patch.object(handoff, "report_failure", side_effect=failed):
+            SwitchTests.run_switch(self)
+
+    def startup(self, *steps):
+        def keys():
+            self.cleared_at = self.clock.now
+            self.term.set(screen=BLANK, status="idle")
+            self.clock.at(0.2, lambda: self.term.set(screen=NO_FOOTER, status="working"))
+            for seconds, action in steps:
+                self.clock.at(seconds, action)
+            return {"turn": 5, "status": "done"}
+        self.on_keys = keys
+
+    def test_a_worker_message_held_during_startup_is_retried_in_the_same_fresh_chat(self):
+        def worker():
+            self.assertIn("held", self.hold("f1", session="fresh"))  # the hook runs ~1.4 s into the frame
+        def blocked_turn_ends():
+            self.term.set(screen=HELD_FRESH, status="done", turn=6)
+        self.startup((1.6, worker), (2.4, blocked_turn_ends))
+        self.run_switch()
+        self.assertEqual(self.state.with_suffix(".received").read_text(), "fresh\n")
+        self.assertEqual(len(self.keys), 1)
+        self.assertEqual([a.get("phase") for a in self.ledger()["attempts"]], [None, "post-clear"])
+        self.assertEqual(handoff.held_entries(self.state)[0]["session"], "fresh")
+        self.assertFalse((self.root / "t1.switch").exists())
+
+    def test_the_guard_stays_armed_while_the_startup_frame_lasts(self):
+        armed = []
+        self.startup(*((t, lambda: armed.append(handoff.guard_armed(self.state, self.record))) for t in (1, 3, 4.5)))
+        settles, original = [], handoff.settle_change
+        def settle(*args):
+            settles.append(self.clock.now - self.cleared_at)
+            return original(*args)
+        with patch.object(handoff, "settle_change", side_effect=settle), \
+                self.assertRaisesRegex(RuntimeError, "The fresh chat stayed busy without a prompt in the footer"):
+            self.run_switch()
+        self.assertEqual(armed, [True, True, True])
+        # Bounded: the grace, then the hook's settle time, and no retry without a held message.
+        self.assertEqual(len(settles), 1)
+        self.assertGreaterEqual(settles[0], handoff.STARTUP_GRACE)
+        self.assertLess(settles[0], handoff.STARTUP_GRACE + 0.5)
+        self.assertEqual(len(self.ledger()["attempts"]), 1)
+        self.assertEqual(len(self.keys), 1)
+        self.assertEqual([s for s in self.sends if s.startswith("Codex Context Handoff:")], [])
+
+    def test_a_person_or_a_draft_during_startup_is_still_final(self):
+        self.startup((1, lambda: self.deliver("wait, not yet", session="fresh")))
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            self.run_switch()
+        self.assertTrue(self.state.with_suffix(".cancelled").is_file())
+        shutil.rmtree(self.root / "session")
+        self.setUp()
+        draft = FRESH.replace("› Ask Codex to do anything", "› my own note")
+        self.startup((1, lambda: self.term.set(screen=draft, status="idle")))
+        with self.assertRaisesRegex(RuntimeError, "Text appeared in the composer"):
+            self.run_switch()
+        self.assertLess(self.failed_at, 1.5)
+        self.assertEqual([s for s in self.sends if s.startswith("Codex Context Handoff:")], [])
+
+    def test_a_multiline_draft_above_the_footer_is_final_at_once(self):
+        # A three-line draft pushes the composer's prompt line above the footer: "no prompt in the footer".
+        draft = NO_FOOTER.replace("╭ Starting", "› my own note\n  second line\n  third line\n\n╭ Starting")
+        self.startup((1, lambda: self.term.set(screen=draft, status="working")))
+        with self.assertRaisesRegex(RuntimeError, "Text appeared in the composer"):
+            self.run_switch()
+        self.assertLess(self.failed_at, 1.5)
+        # A worker message's own prompt line is not a draft.
+        worker = NO_FOOTER.replace("╭ Starting", "› " + REPORT_TEXT[:40] + "\n  more\n\n╭ Starting")
+        self.assertFalse(handoff.draft_above_footer(worker, OLD))
+        self.assertFalse(handoff.draft_above_footer(NO_FOOTER + "› /clear\n", OLD))
+
+    def test_footerless_frames_are_tolerated_only_while_working(self):
+        cache = {}
+        for status, expected in (("working", None), ("idle", "No fresh, empty prompt after /clear (no prompt in the footer)"),
+                                 ("done", "The fresh chat reported done")):
+            with self.subTest(status=status):
+                view = (status, 5, 0, NO_FOOTER)
+                self.assertEqual(handoff.fresh_chat_problem(view, self.state, self.record, OLD, 5, False, cache,
+                                                            startup=True), expected)
+        # Blank is the redraw echo only: never past CLEAR_ECHO, even in startup.
+        self.assertIsNotNone(handoff.fresh_chat_problem(("working", 5, 0, BLANK), self.state, self.record, OLD, 5,
+                                                        False, cache, startup=True))
+
+
+def fresh_first_turn(turn, text=None):
+    """A fresh chat's first turn as Codex 0.169 writes it before the prompt hook runs (live Goal-02)."""
+    rows = [
+        event("task_started", turn_id=turn, turn_attribution={"turn_id": turn, "turn_trigger": "user"}),
+        {"type": "response_item", "payload": {"type": "additional_tools", "role": "developer", "tools": []}},
+        {"type": "response_item", "payload": {"type": "message", "role": "developer",
+                                              "content": [{"type": "input_text", "text": "You are Codex"}]}},
+        {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "<environment_context>\n  <cwd>/w</cwd>\n</environment_context>"}]}},
+        {"type": "world_state", "payload": {"full": True}},
+        {"type": "turn_context", "payload": {"turn_id": turn}},
+        event("thread_settings_applied", thread_id="fresh"),
+    ]
+    return rows
+
+
+@own_tests_only
+class FreshRolloutTests(PostClearStartupTests):
+    """The fresh chat's own rollout: a turn that started without content is its prompt on the way to the
+    hook (waited for, guard armed); content no held message explains is final."""
+
+    def setUp(self):
+        PostClearStartupTests.setUp(self)
+        self.sessions = self.root / "home" / "sessions"
+        day = self.sessions / handoff.time.strftime("%Y/%m/%d")
+        day.mkdir(parents=True)
+        source = day / "rollout-2000-01-01T00-00-00-session.jsonl"
+        source.write_text(self.transcript.read_text())
+        self.transcript = source
+        self.record["transcript"] = str(source)
+        self.state.write_text(json.dumps(self.record))
+        self.fresh = None
+
+    def fresh_rows(self, *rows):
+        if self.fresh is None:
+            stamp = handoff.time.strftime("rollout-%Y-%m-%dT%H-%M-%S", handoff.time.localtime())
+            self.fresh = self.transcript.parent / f"{stamp}-fresh.jsonl"
+            meta = {"type": "session_meta", "payload": {"id": "fresh", "cwd": str(self.root)}}
+            self.fresh.write_text(json.dumps(meta) + "\n")
+        with self.fresh.open("a") as stream:
+            stream.writelines(json.dumps(row) + "\n" for row in rows)
+
+    def queued_worker(self, hook_at, steps=()):
+        """FRESH first, then Herdr submits a queued worker message whose hook runs only at `hook_at`."""
+        def keys():
+            self.cleared_at = self.clock.now
+            self.term.set(screen=FRESH, status="idle")
+            def submitted():
+                self.fresh_rows(*fresh_first_turn("f1"))
+                self.term.set(screen=NO_FOOTER, status="working")
+            self.clock.at(0.6, submitted)
+            for seconds, action in steps or ((hook_at, self.blocked),):
+                self.clock.at(seconds, action)
+            return {"turn": 5, "status": "done"}
+        self.on_keys = keys
+
+    def blocked(self):
+        self.assertIn("held", self.hold("f1", session="fresh"))
+        self.fresh_rows(event("task_complete", turn_id="f1", last_agent_message=None))
+        self.term.set(screen=HELD_FRESH, status="done", turn=6)
+
+    def test_the_first_turn_context_is_not_content(self):
+        self.fresh_rows(*fresh_first_turn("f1"))
+        self.assertEqual(handoff.turns_since(self.fresh, None), [{"id": "f1", "complete": False, "content": False}])
+        self.assertEqual(handoff.fresh_chat_turns(self.record, self.state, handoff.time.time() - 5), "pending")
+        self.assertEqual(handoff.fresh_chat_turns(self.record, self.state, handoff.time.time() + 5), "none")  # too old
+
+    def test_a_hook_slower_than_the_input_settle_still_holds_after_the_first_fresh_prompt(self):
+        self.queued_worker(hook_at=4.5)  # 3.9 s after the screen changed: past INPUT_SETTLE
+        self.run_switch()
+        self.assertEqual(self.state.with_suffix(".received").read_text(), "fresh\n")
+        self.assertEqual(len(self.keys), 1)
+        self.assertEqual([a.get("phase") for a in self.ledger()["attempts"]], [None, "post-clear"])
+        self.assertEqual(len([s for s in self.sends if s.startswith("Codex Context Handoff:")]), 1)
+
+    def test_a_turn_that_never_reaches_its_hook_is_bounded_with_the_guard_armed(self):
+        armed = []
+        self.queued_worker(None, steps=[(t, lambda: armed.append(handoff.guard_armed(self.state, self.record)))
+                                        for t in (3, 6, 9)])
+        with self.assertRaisesRegex(RuntimeError, "did not finish within 10s"):
+            self.run_switch()
+        self.assertEqual(armed, [True, True, True])
+        self.assertGreaterEqual(self.failed_at, 0.6 + handoff.PENDING_TURN_WAIT)
+        self.assertLess(self.failed_at, 0.6 + handoff.PENDING_TURN_WAIT + 1)
+        self.assertEqual([s for s in self.sends if s.startswith("Codex Context Handoff:")], [])
+
+    def test_unheld_content_in_the_fresh_chat_is_final(self):
+        def answered():
+            self.fresh_rows(*report_rows(), event("item_completed", item={"type": "AgentMessage", "content": []}))
+        self.queued_worker(None, steps=[(1.5, answered)])
+        with self.assertRaisesRegex(RuntimeError, "Content that no held worker message explains"):
+            self.run_switch()
+        self.assertLess(self.failed_at, 1.8)
+        self.assertEqual([s for s in self.sends if s.startswith("Codex Context Handoff:")], [])
+
+    def test_an_idle_fresh_prompt_with_a_pending_turn_never_gets_the_continuation(self):
+        # The screen still shows the fresh placeholder while Codex has started a turn: no settling.
+        def started():
+            self.fresh_rows(*fresh_first_turn("f1"))
+        def keys():
+            self.cleared_at = self.clock.now
+            self.term.set(screen=FRESH, status="idle")
+            self.clock.at(0.6, started)
+            self.clock.at(5.0, self.blocked)
+            return {"turn": 5, "status": "done"}
+        self.on_keys = keys
+        sent_at = []
+        original = self.fake_hc
+        def fake(*args, timeout=8):
+            if args[0] == "send" and args[-1].startswith("Codex Context Handoff:"):
+                sent_at.append(self.clock.now - self.cleared_at)
+            return original(*args, timeout=timeout)
+        self.fake_hc = fake
+        self.run_switch()
+        self.assertEqual(self.state.with_suffix(".received").read_text(), "fresh\n")
+        self.assertEqual(len(sent_at), 1)
+        self.assertGreater(sent_at[0], 5.0 + handoff.SETTLE)
+
+
 @own_tests_only
 class CoreReviewWorkerTests(WorkerReviewTests):
     def test_m3_session_start_is_utc_whatever_the_local_zone(self):

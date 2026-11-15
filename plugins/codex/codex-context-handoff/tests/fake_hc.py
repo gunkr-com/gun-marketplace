@@ -94,10 +94,12 @@ def main():
                 context = {key: world[key] for key in ("session", "transcripts", "cwd", "hook_env", "script")}
                 context["call"] = len(world["calls"])
                 context["turn"] = f"u{context['call']}"
+                context["hook_delay"] = world.get("hook_delay", 0)
                 # Codex starts the turn before its UserPromptSubmit hook runs.
                 append_rows(world["transcripts"].get(world["session"]), started(context["turn"]))
                 codex["status"] = {"app": "codex", "state": "working"}
     if out is None:
+        time.sleep(context["hook_delay"])  # Codex may take a while to run the hook (startup, MCP servers)
         result, run = run_hook(context, args[-1])
         with World() as world:
             world["hook_runs"].append(run)
@@ -158,8 +160,9 @@ def handle(world, args):
         before = {"turn": codex["turn"], "status": codex["status"]["state"]}
         if "".join(args[2:]).startswith("/clear"):
             world["session"] = world["next_session"]
-            world["screen"] = FRESH
-            codex["status"] = {"app": "codex", "state": "idle"}
+            # `startup_frame`: the fresh chat stays busy without a prompt in the footer until a prompt runs.
+            world["screen"] = world.get("startup_frame") or FRESH
+            codex["status"] = {"app": "codex", "state": "working" if world.get("startup_frame") else "idle"}
             codex["status_ms"] = int(time.time() * 1000)
         return before, 0
     if command == "kill":

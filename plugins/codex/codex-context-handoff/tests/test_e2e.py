@@ -208,6 +208,27 @@ class EndToEndTests(unittest.TestCase):
         self.assertNotIn("--if", sends[0])
         self.assert_only_fake_herdr()
 
+    def test_a_worker_message_submitted_while_the_fresh_chat_starts_is_held(self):
+        # Live Goal-02: Herdr submits a queued worker message during the fresh chat's startup, the screen
+        # shows no prompt in the footer, and Codex runs the hook ~1.5 s later. The switch must wait for it.
+        world = self.world()
+        world.update(startup_frame="  >_ OpenAI Codex (v0.169.0)\n\n  Starting MCP servers (0/1)\n\n"
+                                   "  Working (0s • esc to interrupt)\n", hook_delay=1.5)
+        self.write_world(world)
+        self.capture()
+        self.wait_for(lambda: "cleared" in self.ledger().get("stages", {}))
+        self.herdr_send(WORKER)
+        self.wait_for(self.finished)
+        self.assertEqual(self.state.with_suffix(".received").read_text(), "fresh\n", self.log())
+        world = self.world()
+        self.assertEqual(sum(1 for call in world["calls"] if call[0] == "keys"), 1)
+        held = [json.loads(line) for line in self.state.with_suffix(".held.jsonl").read_text().splitlines()]
+        self.assertEqual([h["session"] for h in held], ["fresh"])
+        self.assertEqual(len(world["accepted"]), 1)  # only the continuation reached a model
+        self.assertTrue(world["accepted"][0]["prompt"].startswith("Codex Context Handoff:"))
+        self.assertEqual([a.get("phase") for a in self.ledger()["attempts"]], [None, "post-clear"], self.log())
+        self.assert_only_fake_herdr()
+
     def test_a_person_in_the_grace_window_wins_and_nothing_is_retried(self):
         self.capture()
         self.wait_for(lambda: "old-idle" in self.ledger().get("stages", {}))

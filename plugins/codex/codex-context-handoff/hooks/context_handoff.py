@@ -47,6 +47,12 @@ TRANSCRIPT_TAIL = 4 * 1024 * 1024
 MAX_NOTE = 12_000
 POLL = 0.2
 CLEAR_ECHO = 3.0  # seconds after /clear in which the old status and screen may still show
+# Seconds after /clear, before the first fresh prompt, in which a working Codex may show no prompt in the
+# footer: it is still drawing the fresh chat, or a prompt Herdr submitted during startup waits for its hook.
+STARTUP_GRACE = 5.0
+# How long a turn that started in the fresh chat without any content may wait for its UserPromptSubmit
+# hook (Codex runs the hook only after the first turn's setup, ~1.5 s in live QA, more with slow MCP servers).
+PENDING_TURN_WAIT = 10.0
 SETTLE = 2.0  # seconds the fresh chat must stay idle with an empty prompt before the continuation
 # Submitted as the whole prompt, this reaches the model and arms a handoff (and a Goal transfer) right away.
 NOW = {"handoff now", "핸드오프 지금"}
@@ -2424,17 +2430,32 @@ def held_seen(state):
 
 
 QUIET_EVENTS = {"task_started", "task_complete", "turn_aborted", "thread_settings_applied"}
+FRESH_CONTENT = "Content that no held worker message explains reached the fresh chat"
+PENDING_LATE = f"A turn in the fresh chat did not finish within {PENDING_TURN_WAIT:g}s"
+
+
+def turn_context_row(item):
+    """A response item Codex adds to a turn itself: developer context and, in a chat's first turn, its
+    tool list and the user-role environment context, written before the UserPromptSubmit hook runs."""
+    kind = item.get("type")
+    if kind == "additional_tools":
+        return True
+    if kind != "message":
+        return False
+    if item.get("role") == "developer":
+        return True
+    return item.get("role") == "user" and message_text(item.get("content")).lstrip().startswith("<environment_context>")
 
 
 def turns_since(transcript, turn_id):
-    """The chat's turns from `turn_id` on, oldest first: {id, complete, content}, or None when that turn
-    is not in the transcript. `content` is anything a person or the model added: a user or agent message,
+    """The chat's turns from `turn_id` on (every turn when `turn_id` is None), oldest first: {id, complete,
+    content}, or None when that turn is not in the transcript. `content` is anything a person or the model added: a user or agent message,
     reasoning, a tool call, a model request (token count), a final answer. A prompt that a
     UserPromptSubmit hook blocked still gets a turn of its own in Codex (seen with 0.169): task_started,
     developer context, then task_complete with no message, and nothing else."""
     tail = TRANSCRIPT_TAIL
     while True:
-        turns, current, seen = [], None, False
+        turns, current, seen = [], None, turn_id is None
         for row_type, item in transcript_rows(transcript, tail, (b'"event_msg"', b'"response_item"')):
             kind = item.get("type")
             if row_type == "event_msg" and kind == "task_started":
@@ -2452,7 +2473,7 @@ def turns_since(transcript, turn_id):
                     current["content"] = current["content"] or bool(item.get("last_agent_message"))
             elif row_type == "event_msg" and kind not in QUIET_EVENTS:
                 current["content"] = True
-            elif row_type == "response_item" and not (kind == "message" and item.get("role") == "developer"):
+            elif row_type == "response_item" and not turn_context_row(item):
                 current["content"] = True
         if seen or tail >= os.path.getsize(transcript):
             return turns if seen else None
@@ -2487,23 +2508,33 @@ def may_be_held(problem):
     a missing guard are final at once."""
     return any(sign in problem for sign in (
         "ran something besides", "(old history)", "reported done", "The fresh chat changed",
+        "stayed busy without a prompt in the footer", "A prompt is starting in the fresh chat",
     ))
 
 
-def settle_change(state, record, held_base, phase, final):
+def settle_change(state, record, held_base, phase, final, turns=None):
     """The screen or Herdr turn changed: give the UserPromptSubmit hook a moment to record why.
 
     A worker message it held makes the change retryable; a cancellation (a person's prompt or `handoff
-    off`) or no explanation at all is final.
+    off`) or no explanation at all is final. `turns` (after /clear) reads the fresh chat's turns: while
+    one has started without content its hook has not decided yet, so the wait (and the armed guard)
+    lasts up to PENDING_TURN_WAIT, and a retry starts only once that turn has finished; content that
+    no held message explains is final at once.
     """
-    deadline = time.monotonic() + INPUT_SETTLE
+    start = time.monotonic()
     while True:
         if stopped(state):
             raise RuntimeError("Handoff was cancelled (a prompt was submitted or the handoff was turned off).")
-        if held_seen(state) > held_base:
+        verdict = turns() if turns else "none"
+        if verdict == "moved":
+            raise RuntimeError(f"{FRESH_CONTENT}. {final}")
+        waiting = verdict == "pending" and time.monotonic() - start < PENDING_TURN_WAIT
+        if held_seen(state) > held_base and not waiting:
+            if verdict == "pending":
+                raise RuntimeError(f"{PENDING_LATE}. {final}")
             raise Retryable("A Herdr worker message arrived and was held for the fresh chat.", phase)
-        if time.monotonic() >= deadline:
-            raise RuntimeError(final)
+        if time.monotonic() - start >= INPUT_SETTLE and not waiting:
+            raise RuntimeError(f"{PENDING_LATE}. {final}" if verdict == "pending" else final)
         time.sleep(POLL)
 
 
@@ -2601,12 +2632,85 @@ def source_moved(record, cache, state=None):
     return cache["moved"]
 
 
-def fresh_chat_problem(view, state, record, old_screen, cleared_turn, echo, cache, history_ok=False):
+def fresh_rollouts(record, state, since):
+    """(session, path) of the chats in this worktree created since `since` (just before /clear, epoch
+    seconds) other than the source: the fresh chat writes its rollout once its first turn starts. A chat
+    whose prompt hook recorded another Codex process is not this terminal's."""
+    folder = sessions_dir(record["transcript"])
+    if folder is None:
+        return []
+    first = time.strftime("rollout-%Y-%m-%dT%H-%M-%S", time.localtime(since - 1.0))
+    days = {time.strftime("%Y/%m/%d", time.localtime(t)) for t in (since - 1.0, time.time())}
+    found = []
+    for day in sorted(days):
+        for path in (folder / day).glob("rollout-*.jsonl"):
+            try:
+                if path.name[:len(first)] < first or path.stat().st_mtime < since - 1.0:
+                    continue
+                with path.open("rb") as stream:
+                    meta = json.loads(stream.readline(1024 * 1024)).get("payload") or {}
+                session = meta.get("id")
+                if not isinstance(session, str) or not ID.fullmatch(session) or session == record["session"]:
+                    continue
+                if not same_cwd(meta.get("cwd"), record["cwd"]):
+                    continue
+                try:
+                    if (state.parent.parent / session / ".prompt-hook").read_text(encoding="utf-8").strip() != str(record["pid"]):
+                        continue
+                except OSError:
+                    pass  # no hook has run there yet
+                found.append((session, path))
+            except (OSError, ValueError, AttributeError):
+                continue
+    return found
+
+
+def fresh_chat_turns(record, state, since):
+    """What the chats created since /clear did, before the continuation: `none`; `held` (every turn is a
+    finished, empty turn of a worker message this plugin held there); `pending` (a turn has started without
+    content: its UserPromptSubmit hook has not decided yet); `moved` (content, or a finished turn no held
+    message explains)."""
+    held = {(entry.get("session"), entry.get("turn")) for entry in held_events(state)}
+    verdict = "none"
+    for session, path in fresh_rollouts(record, state, since):
+        for turn in turns_since(path, None) or []:
+            if turn["content"] or (turn["complete"] and (session, turn["id"]) not in held):
+                return "moved"
+            if not turn["complete"]:
+                verdict = "pending"
+            elif verdict == "none":
+                verdict = "held"
+    return verdict
+
+
+def draft_above_footer(screen, old_screen):
+    """Whether a working Codex with no prompt in its footer shows a prompt line no worker message
+    explains: a multi-line draft pushes the composer's `›` line above the footer. The fresh chat has
+    no history of its own, so only a worker message, the typed /clear or the old chat's lines may show."""
+    old = set(old_screen.splitlines()) if old_screen else set()
+    for line in screen.splitlines():
+        if not line.startswith("›") or line in old:
+            continue
+        text = line[1:].strip()
+        if text and line.rstrip() != PLACEHOLDER and not text.startswith("<hc") and not "/clear".startswith(text):
+            return True
+    return False
+
+
+def fresh_chat_problem(view, state, record, old_screen, cleared_turn, echo, cache, history_ok=False,
+                       startup=False, since=None):
     """Why the switch must stop now, or None while the fresh chat may still be starting.
 
     Codex reports `working` while MCP servers start after /clear, with the fresh, empty prompt
     on screen. That one busy period is allowed; a prompt, a draft, a dialog, a finished turn or
     a second busy period is not. `echo` covers the moment before Codex redraws after /clear.
+    `startup` covers the first seconds before any fresh prompt showed: a footerless frame while
+    working is not final yet, because a worker message Herdr submits during startup draws over the
+    footer before its UserPromptSubmit hook holds it. `since` (just before /clear) lets the fresh chat's
+    rollout speak too: a turn that started there without content is waited for (PENDING_TURN_WAIT, also
+    after the first fresh prompt), and content no held message explains is final. The guard stays armed
+    all the while, so a person's prompt still cancels and a draft is still final at once; the
+    continuation still needs the fresh placeholder to settle (`cache["turns"]` blocks settling).
     """
     if stopped(state):
         return "Handoff was cancelled (a prompt was submitted or the handoff was turned off)"
@@ -2619,6 +2723,15 @@ def fresh_chat_problem(view, state, record, old_screen, cleared_turn, echo, cach
         return f"Stopped: {changed}"
     if source_moved(record, cache, state):
         return "The old chat started another turn"
+    turns = cache["turns"] = fresh_chat_turns(record, state, since) if since is not None else "none"
+    if turns == "moved":
+        return FRESH_CONTENT
+    if turns == "pending":
+        cache.setdefault("pending_since", time.monotonic())
+        if time.monotonic() - cache["pending_since"] >= PENDING_TURN_WAIT:
+            return PENDING_LATE
+    else:
+        cache.pop("pending_since", None)
     if view is None:
         return "The terminal no longer runs the original Codex in this worktree"
     status, turn, since, screen = view
@@ -2646,10 +2759,24 @@ def fresh_chat_problem(view, state, record, old_screen, cleared_turn, echo, cach
         if draft.startswith("<hc"):
             return None  # Herdr is pasting a worker message; its hook decides
         return "Text appeared in the composer"
+    if shown == "no prompt in the footer" and status == "working":
+        if screen is not None and draft_above_footer(screen, old_screen):
+            return "Text appeared in the composer"
+        if startup or turns == "pending":
+            return None
+        return "The fresh chat stayed busy without a prompt in the footer"
+    if turns == "pending" and status == "working" and shown not in {"text in the composer", "unreadable"}:
+        return None  # its prompt is still on its way to the hook; settling waits for it
     return f"No fresh, empty prompt after /clear ({shown})"
 
 
-def await_fresh_chat(record, state, old_screen, cleared_turn, cache, rebased=False, held_base=0, history_ok=False):
+def fresh_turns(record, state, since):
+    """settle_change's reader of the fresh chat's turns, or None without the /clear time."""
+    return None if since is None else (lambda: fresh_chat_turns(record, state, since))
+
+
+def await_fresh_chat(record, state, old_screen, cleared_turn, cache, rebased=False, held_base=0, history_ok=False,
+                     since=None):
     """Return (turn, status time, screen) once the fresh chat has stayed idle at an empty prompt.
 
     `rebased`: a later attempt in the same fresh chat (after a held worker message or a continuation
@@ -2663,6 +2790,7 @@ def await_fresh_chat(record, state, old_screen, cleared_turn, cache, rebased=Fal
         + (", same fresh chat as the previous attempt" if rebased else "") + ")")
     settled = shown = None
     echo = not rebased  # until Codex has redrawn: closed after CLEAR_ECHO or at the first fresh prompt
+    startup = not rebased  # until the first fresh prompt, at most STARTUP_GRACE
     while True:
         now = time.monotonic()
         elapsed = now - start
@@ -2673,13 +2801,16 @@ def await_fresh_chat(record, state, old_screen, cleared_turn, cache, rebased=Fal
             shown = summary
         fresh = view is not None and prompt_state(view[3], old_screen, history_ok) == "fresh"
         echo = echo and elapsed < CLEAR_ECHO and not fresh
-        problem = fresh_chat_problem(view, state, record, old_screen, cleared_turn, echo, cache, history_ok)
+        startup = startup and elapsed < STARTUP_GRACE and not fresh
+        problem = fresh_chat_problem(view, state, record, old_screen, cleared_turn, echo, cache, history_ok, startup,
+                                     since)
         if problem:
             message = f"{problem} {elapsed:.1f}s after /clear ({summary})."
             if not may_be_held(problem):
                 raise RuntimeError(message)
-            settle_change(state, record, held_base, "post-clear", message)
-        if (view[0] == "idle" or (history_ok and view[0] == "done")) and fresh:
+            settle_change(state, record, held_base, "post-clear", message, fresh_turns(record, state, since))
+        pending = cache.get("turns") == "pending"  # a prompt is on its way to its hook: never settle meanwhile
+        if (view[0] == "idle" or (history_ok and view[0] == "done")) and fresh and not pending:
             if settled is None or settled[0] != view[1:]:
                 settled = (view[1:], now)
             elif now - settled[1] >= SETTLE:
@@ -3195,19 +3326,23 @@ def post_clear(record, state, context):
         cleared_turn = view[1]
         context["cleared_turn"] = cleared_turn
     cache = context.setdefault("cache", {})
-    settled = await_fresh_chat(record, state, old_screen, cleared_turn, cache, rebased, held_base, history_ok)
+    # Chats created since just before /clear: the fresh chat's rollout, once its first turn starts.
+    since = (ledger.get("clear") or {}).get("intent_at") or typed_at
+    settled = await_fresh_chat(record, state, old_screen, cleared_turn, cache, rebased, held_base, history_ok, since)
     set_stage(state, "fresh-ready")
     # Final recheck immediately before the continuation.
     view = look(record)
-    problem = fresh_chat_problem(view, state, record, old_screen, cleared_turn, False, cache, history_ok)
+    problem = fresh_chat_problem(view, state, record, old_screen, cleared_turn, False, cache, history_ok, since=since)
     if problem and not may_be_held(problem):
         raise RuntimeError(f"{problem} just before the continuation ({describe(view, old_screen, history_ok)}).")
     ready = view is not None and (view[0] == "idle" or (history_ok and view[0] == "done"))
+    if cache.get("turns") == "pending":
+        problem = problem or "A prompt is starting in the fresh chat"
     if problem or not ready or view[1:] != settled:
         settle_change(state, record, held_base, "post-clear", (
             f"{problem or 'The fresh chat changed'} just before the continuation "
             f"({describe(view, old_screen, history_ok)})."
-        ))
+        ), fresh_turns(record, state, since))
     send_turn = view[1]
     update_ledger(state, lambda data: (data.update(phase="sending"), data["sends"].append(
         {"intent_at": time.time(), "turn": send_turn}
