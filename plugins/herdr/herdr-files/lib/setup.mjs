@@ -7,7 +7,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.1.1";
 export const MIN_NODE = 22;
 export const MOD = "herdr-files";
 export const BLOCK = "files"; // the block id Herdr's tab bar toggles; kept as is
@@ -20,7 +20,7 @@ export function paths() {
   return { app, mods: path.join(app, "mods"), mod: path.join(app, "mods", MOD), layouts: path.join(app, "layouts"), state, info: path.join(state, "install.json"), backups: path.join(state, "backups") };
 }
 
-export const supportedPlatform = () => ["darwin", "linux"].includes(process.platform);
+export const supportedPlatform = () => ["darwin", "linux", "win32"].includes(process.platform);
 
 export function readJson(file, fallback = null) {
   try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; }
@@ -33,31 +33,57 @@ export function writeAtomic(file, text) {
   const tmp = `${file}.tmp-${process.pid}`;
   try {
     fs.writeFileSync(tmp, text, { mode });
-    fs.renameSync(tmp, file);
+    renameRetry(tmp, file);
   } catch (e) { fs.rmSync(tmp, { force: true }); throw e; }
+}
+
+/** fs.renameSync, retried for about a second on Windows, where an indexer or virus
+ *  scanner briefly holding a file inside a folder makes renaming it fail. */
+export function renameRetry(from, to) {
+  for (let i = 0; ; i++) {
+    try { return fs.renameSync(from, to); } catch (e) {
+      if (process.platform !== "win32" || i >= 10 || !["EPERM", "EBUSY", "EACCES"].includes(e.code)) throw e;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    }
+  }
 }
 
 export const sha256 = (text) => crypto.createHash("sha256").update(text).digest("hex");
 export const layoutFile = (P, name) => path.join(P.layouts, `${name}.json`);
 export const validLayoutName = (name) => typeof name === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) && !name.endsWith(".json");
 
+// Windows has no execute bit: a file is enough, and only .exe names are looked up
+// (an extensionless herdr-app beside herdr-app.exe is a shell script spawnSync can't run).
 const isExec = (p) => { try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch { return false; } };
 export function which(name) {
-  for (const dir of (process.env.PATH || "").split(path.delimiter)) if (dir && isExec(path.join(dir, name))) return path.join(dir, name);
+  const file = process.platform === "win32" && !/\.exe$/i.test(name) ? `${name}.exe` : name;
+  for (const entry of (process.env.PATH || "").split(path.delimiter)) {
+    const dir = entry.replace(/^"(.*)"$/, "$1"); // Windows allows quoted PATH entries
+    if (dir && isExec(path.join(dir, file))) return path.join(dir, file);
+  }
   return null;
+}
+
+/** Where Herdr's installers put herdr-app, in the order they are tried after PATH. */
+export function herdrAppCandidates({ platform = process.platform, env = process.env, home = os.homedir() } = {}) {
+  if (platform === "win32") {
+    const p = path.win32, local = env.LOCALAPPDATA || p.join(home, "AppData", "Local");
+    return [p.join(local, "Programs", "herdr-app", "herdr-app.exe"), p.join(local, "herdr-app", "herdr-app.exe"), p.join(home, ".local", "bin", "herdr-app.exe")];
+  }
+  const p = path.posix, cands = [p.join(home, ".local", "bin", "herdr-app")];
+  if (platform === "darwin") cands.push("/Applications/Herdr.app/Contents/MacOS/Herdr", p.join(home, "Applications", "Herdr.app", "Contents", "MacOS", "Herdr"));
+  return cands;
 }
 
 /** herdr-app: HERDR_APP_BIN, else PATH, else the usual install locations. */
 export function findHerdrApp() {
   if (process.env.HERDR_APP_BIN) return isExec(process.env.HERDR_APP_BIN) ? process.env.HERDR_APP_BIN : null;
-  const cands = [which("herdr-app"), path.join(os.homedir(), ".local", "bin", "herdr-app")];
-  if (process.platform === "darwin") cands.push("/Applications/Herdr.app/Contents/MacOS/Herdr", path.join(os.homedir(), "Applications", "Herdr.app", "Contents", "MacOS", "Herdr"));
-  return cands.find((p) => p && isExec(p)) ?? null;
+  return [which("herdr-app"), ...herdrAppCandidates()].find((p) => p && isExec(p)) ?? null;
 }
 
 /** Run herdr-app; returns {ok, out}. Never throws. Only `check` and `status` are used: neither changes the window. */
 export function herdr(bin, args, timeout = 60_000) {
-  const r = spawnSync(bin, args, { encoding: "utf8", timeout });
+  const r = spawnSync(bin, args, { encoding: "utf8", timeout, windowsHide: true });
   const out = `${r.stdout ?? ""}${r.stderr ?? ""}`.trim();
   return { ok: r.status === 0 && !/^\s*\{\s*"error"/.test(r.stdout ?? ""), out: out || String(r.error?.message ?? "") };
 }

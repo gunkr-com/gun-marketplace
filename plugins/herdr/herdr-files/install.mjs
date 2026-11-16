@@ -15,7 +15,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  VERSION, MIN_NODE, MOD, BLOCK, SHIPPED_MOD, paths, supportedPlatform, readJson, writeAtomic, sha256, layoutFile, validLayoutName,
+  VERSION, MIN_NODE, MOD, BLOCK, SHIPPED_MOD, paths, supportedPlatform, readJson, writeAtomic, renameRetry, sha256, layoutFile, validLayoutName,
   findHerdrApp, herdr, selectedLayout, isShippedLayout, isOurMod, planPatch, pointFiles, layoutText,
 } from "./lib/setup.mjs";
 
@@ -41,7 +41,7 @@ if ([opts.layout, opts.create, opts.noLayout || null].filter(Boolean).length > 1
 for (const n of [opts.layout, opts.create, opts.from]) if (n != null && !validLayoutName(n)) fail(`"${n}" is not a layout name`, "Use the file name without .json, e.g. my-layout.");
 
 // ---- 1. Checks (no writes) --------------------------------------------------
-if (!supportedPlatform()) fail(`unsupported platform ${process.platform}`, "herdr-files supports macOS and Linux.");
+if (!supportedPlatform()) fail(`unsupported platform ${process.platform}`, "herdr-files supports macOS, Linux and Windows.");
 if (Number(process.versions.node.split(".")[0]) < MIN_NODE) fail(`Node.js ${process.versions.node} is too old`, `Run it with Node.js ${MIN_NODE} or newer.`);
 const P = paths();
 if (!fs.existsSync(P.mods) || !fs.existsSync(P.layouts)) fail(`Herdr home not found at ${P.app}`, "Open Herdr once, or set HERDR_APP_HOME to its home folder.");
@@ -94,7 +94,7 @@ function copyTree(from, to) {
   }
 }
 const stage = fs.mkdtempSync(path.join(P.app, ".herdr-files-stage-"));
-const cleanStage = () => fs.rmSync(stage, { recursive: true, force: true });
+const cleanStage = () => fs.rmSync(stage, { recursive: true, force: true, maxRetries: 5 });
 copyTree(path.join(repo, "mod", MOD), path.join(stage, MOD));
 const checked = herdr(hrd, ["check", path.join(stage, MOD)]);
 if (!checked.ok) { cleanStage(); fail("herdr-app check failed for the mod", checked.out.split("\n").slice(0, 6).join("\n  ")); }
@@ -108,9 +108,9 @@ const lines = [];
 let show = null;
 try {
   const old = path.join(stage, `${MOD}.old`);
-  if (exists(P.mod)) { fs.renameSync(P.mod, old); undo.push(() => { fs.rmSync(P.mod, { recursive: true, force: true }); fs.renameSync(old, P.mod); }); }
-  else undo.push(() => fs.rmSync(P.mod, { recursive: true, force: true }));
-  fs.renameSync(path.join(stage, MOD), P.mod);
+  if (exists(P.mod)) { renameRetry(P.mod, old); undo.push(() => { fs.rmSync(P.mod, { recursive: true, force: true, maxRetries: 5 }); renameRetry(old, P.mod); }); }
+  else undo.push(() => fs.rmSync(P.mod, { recursive: true, force: true, maxRetries: 5 }));
+  renameRetry(path.join(stage, MOD), P.mod);
   lines.push(`mod -> ${P.mod}`);
 
   if (!exists(P.state)) { fs.mkdirSync(P.state); undo.push(() => fs.rmSync(P.state, { recursive: true, force: true })); }

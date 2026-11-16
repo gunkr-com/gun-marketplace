@@ -5,7 +5,7 @@ description: Install, update, check or remove herdr-files, a Files panel for the
 
 # herdr-files
 
-The plugin root is `<directory containing this SKILL.md>/../..`. It holds `install.mjs`, `uninstall.mjs`, `status.mjs` and the mod they install. Run them with Node.js 22 or newer from any folder; below, `<root>` is the plugin root's absolute path. macOS and Linux are supported.
+The plugin root is `<directory containing this SKILL.md>/../..`. It holds `install.mjs`, `uninstall.mjs`, `status.mjs` and the mod they install. Run them with Node.js 22 or newer from any folder; below, `<root>` is the plugin root's absolute path. macOS, Linux and Windows are supported. On Windows, run the commands below from PowerShell with `node`; the installer finds `herdr-app.exe` on `PATH` or in `%LOCALAPPDATA%\Programs\herdr-app`.
 
 Nothing installs on its own: run the installer when the person asks to install or update herdr-files. That request is the approval. In one short message, say what it changes (below), then run it. Ask only when something outside that scope is needed, such as choosing a layout or resolving a name collision.
 
@@ -56,4 +56,4 @@ node <root>/uninstall.mjs
 - **Editing:** only local `.md`, `.markdown`, `.mdx`, `.txt` and `.text` files, and files with no extension, can be edited. Remote files, truncated files (over 400,000 characters or near the 1 MiB read limit) and other types open read-only with a label; binary files show no text.
 - **Saving:** nothing is written until Save or Cmd-S/Ctrl-S. If the file changed or was deleted on disk since it was opened, Save writes nothing and offers reload, overwrite, recreate or copy.
 - **Unsaved changes:** closing or switching files asks to Save, Discard or Cancel. Unsaved text is lost if the panel itself is restarted (a layout switch, quitting Herdr, or an update of the mod).
-- **Self-test:** while the panel is shown, `herdr-app do herdr-files.selftest` runs a self-test with the real file APIs in a new `/tmp/herdr-files-selftest.XXXXXX` folder and posts the result as a notification.
+- **Self-test:** while the panel is shown, `herdr-app do herdr-files.selftest` runs a self-test with the real file APIs in a new scratch folder (`/tmp/herdr-files-selftest.XXXXXX`, or `%TEMP%\herdr-files-selftest.<random>` on Windows) and posts the result as a notification.

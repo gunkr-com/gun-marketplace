@@ -13,7 +13,7 @@ herdr-files replaces the mod behind Herdr's Files panel (the one the tab bar's F
 - **Other folders.**
   - `↑` goes to the parent folder.
   - `Open…` picks a folder with the system dialog.
-  - `Path` takes a typed or pasted path. Spaces, quotes, `My\ Folder` escapes, `~` and relative paths work, and the folder is checked before the panel switches to it.
+  - `Path` takes a typed or pasted path. Spaces, quotes, `~` and relative paths (`..`, `sub/dir`) work, and the folder is checked before the panel switches to it. POSIX folders also take `My\ Folder` escapes. Windows folders take `C:\…` or `C:/…`, `\\server\share\…` and `\…` on the current drive; `..` stops at the drive or share, and drive-relative `D:x` is refused. The style follows the shown folder, so a remote macOS or Linux folder keeps POSIX paths on a Windows computer.
   - `Project` goes back to following the focused pane's folder.
   - The chosen folder is kept per space. The full path and a `manual` mark show under the header.
 - **Editing local Markdown and text.**
@@ -39,8 +39,8 @@ Binary files show no text.
 
 ### Requirements
 
-- macOS or Linux. Checked on macOS with Herdr 0.1.15 (`herdr-app check`, an installer smoke run against a temporary Herdr home, and the self-test of an equivalent local copy); not reviewed visually. Linux runs the automated tests only. Windows is not supported: path handling is POSIX.
-- The Herdr app, opened at least once (`herdr-app` on `PATH`, in `~/.local/bin`, or set `HERDR_APP_BIN`).
+- macOS, Linux or Windows. Checked on macOS with Herdr 0.1.15 (`herdr-app check`, an installer smoke run against a temporary Herdr home, and the self-test of an equivalent local copy), and on Windows 11 with Herdr 0.1.16 (`herdr-app check` and an installer round trip against a temporary Herdr home, and the folder commands against real PowerShell); not reviewed visually. Linux runs the automated tests only.
+- The Herdr app, opened at least once (`herdr-app` on `PATH`, in `~/.local/bin`, on Windows `herdr-app.exe` in `%LOCALAPPDATA%\Programs\herdr-app`, or set `HERDR_APP_BIN`).
 - Node.js 22 or newer for the installer (tested with 24). The mod itself runs inside Herdr.
 - A personal layout with a block whose id is `files`, such as a copy of Herdr's main layout. The installer can make that copy for you.
 
@@ -86,7 +86,7 @@ Herdr's own layouts (`main`, `terminals`, `win98`) are replaced on every start, 
 
 Everything is checked before the layout, the mod folder or the state is written (platform, Node.js, Herdr home, `herdr-app`, name collisions, the layout, and `herdr-app check` of the staged mod); a failed check changes nothing. If writing fails partway, the installer puts the previous mod, layout and state back. Running it again updates in place, keeps the recorded original and makes no new backup when nothing changes.
 
-The mod runs programs through Herdr: `sh` to list folders, `git` for status marks, and `test -d` and `mktemp` for the path check and the self-test. It reads and writes files only through Herdr's file API, and makes no network requests.
+The mod runs programs through Herdr: `sh` to list folders, `git` for status marks, and `test -d` and `mktemp` for the path check and the self-test. On Windows, and for a remote Windows folder, Windows PowerShell does the listing, the folder check and the self-test's folder setup instead; a path reaches it as UTF-8 Base64 data, never as code. It reads and writes files only through Herdr's file API, and makes no network requests.
 
 ### Update
 
@@ -109,7 +109,7 @@ node uninstall.mjs
 - The panel does not warn while you edit that the file changed on disk. Save catches it.
 - Remote files are read-only: Herdr's `writeTextFile` writes only on this computer. The system folder picker is local only too.
 - Only the extensions above are editable; other text files are read-only previews.
-- Paths are POSIX. On Windows the shipped panel's folder listing is kept, but navigation and editing are not supported.
+- On Windows, the folder list is not watched for a drive or share root or the home folder (Windows watches recursively); the 10-second refresh still runs. Short names (`PROGRA~1`) and `subst` drives are shown as Herdr reports them.
 - There is no automated visual test of the panel; the tests cover its logic, the installer, and (through the self-test) Herdr's real file and editor APIs.
 
 ### Self-test
@@ -120,7 +120,7 @@ While the panel is shown, run:
 herdr-app do herdr-files.selftest
 ```
 
-It drives the editor with Herdr's real `readTextFile`, `writeTextFile` and editor in a fresh `/tmp/herdr-files-selftest.XXXXXX` folder: edit, save, external change, overwrite, delete and recreate, stale load, truncated, binary and read-only files. It writes nothing outside that folder, and posts the result as a notification with the path to `result.json`.
+It drives the editor with Herdr's real `readTextFile`, `writeTextFile` and editor in a fresh scratch folder (`/tmp/herdr-files-selftest.XXXXXX`, or `%TEMP%\herdr-files-selftest.<random>` on Windows): edit, save, external change, overwrite, delete and recreate, stale load, truncated, binary and read-only files, a CRLF file, and the folder check, listing and parent navigation for a folder whose name has spaces, apostrophes and Unicode. It writes nothing outside that folder, and posts the result as a notification with the path to `result.json`.
 
 ### Tests
 
@@ -130,7 +130,9 @@ node test/catalog-check.mjs
 ```
 
 - `test/core.test.mjs` drives the document logic with fake file IO: dirty state, guarded saves, conflicts, deletion, saves in flight, stale loads, and the unsaved-changes prompt.
-- `test/setup.test.mjs` runs install, update, status and uninstall against a temporary Herdr home and a stub `herdr-app`. It covers rollback after a write failure, refusals, ownership and unreadable layouts, and proves no window command is sent.
+- `test/core.test.mjs` also covers POSIX and Windows paths: drive and UNC roots, both separators, `..`, `~`, quotes, refusals, and a remote POSIX folder seen from Windows.
+- `test/folders.test.mjs` checks which program each platform and path style uses, and runs the real commands (PowerShell on Windows, `sh` elsewhere) in a temporary folder whose names have quotes, `$`, `&` and Unicode.
+- `test/setup.test.mjs` runs install, update, status and uninstall against a temporary Herdr home and a stub `herdr-app` (this Node binary under that name, so it runs on every platform). It covers rollback after a write failure, refusals, ownership, unreadable layouts and finding `herdr-app.exe`, and proves no window command is sent. On Windows with Herdr installed, it also runs the real `herdr-app check` in a temporary Herdr home.
 
 ### License
 
@@ -145,7 +147,7 @@ herdr-files는 개인 레이아웃에서 Herdr의 Files 패널(탭 바의 Files 
 - **다른 폴더로 이동.**
   - `↑`는 상위 폴더로 갑니다.
   - `Open…`은 시스템 대화 상자로 폴더를 고릅니다.
-  - `Path`는 입력하거나 붙여 넣은 경로로 갑니다. 공백, 따옴표, `My\ Folder` 같은 이스케이프, `~`, 상대 경로를 받고, 옮기기 전에 폴더인지 확인합니다.
+  - `Path`는 입력하거나 붙여 넣은 경로로 갑니다. 공백, 따옴표, `~`, 상대 경로(`..`, `sub/dir`)를 받고, 옮기기 전에 폴더인지 확인합니다. POSIX 폴더에서는 `My\ Folder` 같은 이스케이프도 받습니다. Windows 폴더에서는 `C:\…`나 `C:/…`, `\\server\share\…`, 현재 드라이브 기준 `\…`를 받고, `..`는 드라이브나 공유 루트에서 멈추며, 드라이브 상대 경로 `D:x`는 거부합니다. 경로 방식은 보이는 폴더를 따르므로, Windows 컴퓨터에서 본 원격 macOS·Linux 폴더는 POSIX 경로를 그대로 씁니다.
   - `Project`는 다시 포커스된 pane의 폴더를 따라갑니다.
   - 고른 폴더는 space마다 따로 기억합니다. 헤더 아래에 전체 경로와 `manual` 표시가 보입니다.
 - **로컬 Markdown·텍스트 편집.**
@@ -171,8 +173,8 @@ herdr-files는 개인 레이아웃에서 Herdr의 Files 패널(탭 바의 Files 
 
 ### 요구 사항
 
-- macOS 또는 Linux. macOS의 Herdr 0.1.15에서 `herdr-app check`, 임시 Herdr home 대상 설치 smoke, 같은 내용의 로컬 사본 self-test로 확인했고, 화면은 따로 검토하지 않았습니다. Linux에서는 자동 테스트만 돌립니다. Windows는 지원하지 않습니다(경로 처리가 POSIX 기준).
-- 한 번 이상 실행한 Herdr 앱(`herdr-app`이 `PATH`나 `~/.local/bin`에 있거나 `HERDR_APP_BIN` 설정)
+- macOS, Linux 또는 Windows. macOS의 Herdr 0.1.15에서 `herdr-app check`, 임시 Herdr home 대상 설치 smoke, 같은 내용의 로컬 사본 self-test로, Windows 11의 Herdr 0.1.16에서 `herdr-app check`와 임시 Herdr home 대상 설치·제거, 실제 PowerShell 대상 폴더 명령으로 확인했고, 화면은 따로 검토하지 않았습니다. Linux에서는 자동 테스트만 돌립니다.
+- 한 번 이상 실행한 Herdr 앱(`herdr-app`이 `PATH`나 `~/.local/bin`에 있거나, Windows에서 `%LOCALAPPDATA%\Programs\herdr-app`에 `herdr-app.exe`가 있거나, `HERDR_APP_BIN` 설정)
 - 설치 스크립트용 Node.js 22 이상(24로 시험). mod는 Herdr 안에서 돕니다.
 - id가 `files`인 블록이 있는 개인 레이아웃(예: Herdr main 레이아웃의 복사본). 설치 스크립트가 복사본을 만들어 줄 수 있습니다.
 
@@ -218,7 +220,7 @@ Herdr 자체 레이아웃(`main`, `terminals`, `win98`)은 시작할 때마다 �
 
 레이아웃, mod 폴더, 상태를 쓰기 전에 모두 확인합니다(플랫폼, Node.js, Herdr home, `herdr-app`, 이름 충돌, 레이아웃, 미리 복사한 mod의 `herdr-app check`). 확인에 실패하면 아무것도 바꾸지 않습니다. 쓰는 도중 실패하면 이전 mod, 레이아웃, 상태를 되돌립니다. 다시 실행하면 그 자리에서 업데이트하고, 기록한 원래 값을 유지하며, 바뀐 게 없으면 새 백업을 만들지 않습니다.
 
-mod는 Herdr를 통해 프로그램을 실행합니다. 폴더 목록에 `sh`, 상태 표시에 `git`, 경로 확인과 self-test에 `test -d`와 `mktemp`를 씁니다. 파일은 Herdr 파일 API로만 읽고 쓰며, 네트워크 요청은 하지 않습니다.
+mod는 Herdr를 통해 프로그램을 실행합니다. 폴더 목록에 `sh`, 상태 표시에 `git`, 경로 확인과 self-test에 `test -d`와 `mktemp`를 씁니다. Windows와 원격 Windows 폴더에서는 Windows PowerShell이 폴더 목록, 폴더 확인, self-test 폴더 준비를 대신하며, 경로는 코드가 아니라 UTF-8 Base64 데이터로 넘깁니다. 파일은 Herdr 파일 API로만 읽고 쓰며, 네트워크 요청은 하지 않습니다.
 
 ### 업데이트
 
@@ -241,7 +243,7 @@ node uninstall.mjs
 - 편집 중에 디스크 파일이 바뀌어도 바로 알리지 않습니다. Save할 때 잡아냅니다.
 - 원격 파일은 읽기 전용입니다. Herdr `writeTextFile`은 이 컴퓨터에서만 씁니다. 시스템 폴더 선택 창도 로컬 전용입니다.
 - 위 확장자만 편집할 수 있고, 다른 텍스트 파일은 읽기 전용 미리 보기입니다.
-- 경로는 POSIX 기준입니다. Windows에서는 기본 패널의 폴더 목록 코드가 남아 있지만 이동과 편집은 지원하지 않습니다.
+- Windows에서는 드라이브·공유 루트와 홈 폴더를 감시하지 않습니다(Windows 감시는 하위 폴더 전체를 봄). 10초마다 새로 고치는 것은 그대로입니다. 짧은 이름(`PROGRA~1`)과 `subst` 드라이브는 Herdr가 알려 준 그대로 보입니다.
 - 패널 화면을 자동으로 확인하는 테스트는 없습니다. 테스트는 로직, 설치 스크립트, 그리고 (self-test로) Herdr의 실제 파일·편집기 API를 다룹니다.
 
 ### Self-test
@@ -252,7 +254,7 @@ node uninstall.mjs
 herdr-app do herdr-files.selftest
 ```
 
-새 `/tmp/herdr-files-selftest.XXXXXX` 폴더에서 Herdr의 실제 `readTextFile`, `writeTextFile`과 편집기로 편집, 저장, 외부 변경, 덮어쓰기, 삭제 후 다시 만들기, 늦은 로드, 잘린·바이너리·읽기 전용 파일을 확인합니다. 그 폴더 밖에는 쓰지 않으며, 결과를 `result.json` 경로와 함께 알림으로 띄웁니다.
+새 임시 폴더(`/tmp/herdr-files-selftest.XXXXXX`, Windows에서는 `%TEMP%\herdr-files-selftest.<임의 이름>`)에서 Herdr의 실제 `readTextFile`, `writeTextFile`과 편집기로 편집, 저장, 외부 변경, 덮어쓰기, 삭제 후 다시 만들기, 늦은 로드, 잘린·바이너리·읽기 전용 파일, CRLF 파일, 그리고 이름에 공백·아포스트로피·유니코드가 든 폴더의 폴더 확인·목록·상위 이동을 확인합니다. 그 폴더 밖에는 쓰지 않으며, 결과를 `result.json` 경로와 함께 알림으로 띄웁니다.
 
 ### 테스트
 
@@ -262,7 +264,9 @@ node test/catalog-check.mjs
 ```
 
 - `test/core.test.mjs`는 가짜 파일 IO로 문서 로직을 검사합니다: 수정 상태, 확인을 거치는 저장, 충돌, 삭제, 진행 중인 저장, 늦은 로드, 저장 안 한 변경 확인.
-- `test/setup.test.mjs`는 임시 Herdr home과 가짜 `herdr-app`으로 설치, 업데이트, 상태, 제거를 돌립니다. 쓰기 실패 후 되돌리기, 거부, 소유 확인, 읽을 수 없는 레이아웃을 다루고, 창에 명령을 보내지 않는다는 것도 확인합니다.
+- `test/core.test.mjs`는 POSIX와 Windows 경로도 다룹니다: 드라이브·UNC 루트, 두 구분자, `..`, `~`, 따옴표, 거부, Windows에서 본 원격 POSIX 폴더.
+- `test/folders.test.mjs`는 플랫폼과 경로 방식마다 어떤 프로그램을 쓰는지 확인하고, 이름에 따옴표·`$`·`&`·유니코드가 든 임시 폴더에서 실제 명령(Windows는 PowerShell, 그 밖은 `sh`)을 돌립니다.
+- `test/setup.test.mjs`는 임시 Herdr home과 가짜 `herdr-app`(이 Node 실행 파일을 그 이름으로 둔 것이라 모든 플랫폼에서 돔)으로 설치, 업데이트, 상태, 제거를 돌립니다. 쓰기 실패 후 되돌리기, 거부, 소유 확인, 읽을 수 없는 레이아웃, `herdr-app.exe` 찾기를 다루고, 창에 명령을 보내지 않는다는 것도 확인합니다. Herdr가 설치된 Windows에서는 임시 Herdr home으로 실제 `herdr-app check`도 돌립니다.
 
 ### 라이선스
 
