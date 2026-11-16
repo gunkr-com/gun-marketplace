@@ -9,18 +9,60 @@ export const MAX_CHARS = 400000;
 // readTextFile reads at most 1 MiB; text this close to it may be cut short.
 export const MAX_BYTES = 1048576 - 4;
 
+// ---- paths ----
+// Two styles. Windows: a drive ("C:\", "C:/", "C:") or a UNC share ("\\server\share";
+// "//server/share" only where Windows style is already chosen, since POSIX reads "//tmp"
+// as "/tmp"), written back with "\" ("C:\", "C:\Users\me", "\\server\share\dir"). Anything else is
+// POSIX ("/" root). The style comes from the path itself, not from the machine running
+// Herdr, so a remote POSIX folder seen from Windows keeps POSIX rules and a remote
+// Windows folder seen from macOS keeps Windows rules.
+
+// Windows path -> { root, parts } ("C:\" or "\\server\share", and the names below), or null.
+function splitWindows(p) {
+  if (typeof p !== "string" || p.startsWith("//")) return null;
+  let s = p.replace(/\//g, "\\");
+  // Device paths: \\?\C:\x -> C:\x, \\?\UNC\server\share -> \\server\share.
+  const device = s.match(/^\\\\[?.]\\(.*)$/);
+  if (device) s = /^UNC\\/i.test(device[1]) ? "\\\\" + device[1].slice(4) : device[1];
+  let m = s.match(/^([A-Za-z]):(?:\\|$)/), root;
+  if (m) root = `${m[1].toUpperCase()}:\\`;
+  else if ((m = s.match(/^\\\\([^\\]+)\\([^\\]+)(?:\\|$)/)) && m[1] !== "?" && m[1] !== ".") root = `\\\\${m[1]}\\${m[2]}`;
+  else return null;
+  return { root, parts: s.slice(m[0].length).split("\\").filter(Boolean) };
+}
+
+function formatWindows(root, parts) {
+  if (!parts.length) return root;
+  return (root.endsWith("\\") ? root : root + "\\") + parts.join("\\");
+}
+
+export const isWindowsPath = (p) => splitWindows(p) !== null;
+
+// A folder with nothing above it: "/", "C:\", "\\server\share".
+export function isRootPath(p) {
+  const w = splitWindows(p);
+  return w ? w.parts.length === 0 : trimSlash(p) === "/";
+}
+
 export function trimSlash(p) {
   if (!p) return p;
+  const w = splitWindows(p);
+  if (w) return formatWindows(w.root, w.parts);
   const t = p.replace(/\/+$/, "");
   return t || "/";
 }
 
+// root: an absolute folder; rel: a tree path below it, always "/"-separated.
 export function joinPath(root, rel) {
-  if (!rel) return root;
+  const w = splitWindows(root);
+  if (!rel) return w ? formatWindows(w.root, w.parts) : root;
+  if (w) return formatWindows(w.root, [...w.parts, ...rel.split(/[\\/]/).filter(Boolean)]);
   return root === "/" ? `/${rel}` : `${root}/${rel}`;
 }
 
 export function parentDir(p) {
+  const w = splitWindows(p);
+  if (w) return w.parts.length ? formatWindows(w.root, w.parts.slice(0, -1)) : null;
   const t = trimSlash(p);
   if (!t || t === "/" || !t.startsWith("/")) return null;
   const i = t.lastIndexOf("/");
@@ -28,15 +70,32 @@ export function parentDir(p) {
 }
 
 export function baseName(p) {
+  const w = splitWindows(p);
+  if (w) return w.parts.length ? w.parts[w.parts.length - 1] : w.root;
   const t = trimSlash(p ?? "");
   return t === "/" ? "/" : t.split("/").pop();
 }
 
+// For comparing and keying paths: Windows paths ignore case and "/" vs "\".
+export function pathKey(p) {
+  const w = splitWindows(p);
+  return w ? formatWindows(w.root, w.parts).toLowerCase() : trimSlash(p);
+}
+export const samePath = (a, b) => a != null && b != null && pathKey(a) === pathKey(b);
+
 // Typed or pasted path -> absolute normalized path, or null.
-// Accepts spaces, surrounding quotes, shell-escaped spaces ("Work\ Dir"), ~ and relative paths.
-export function resolveInput(input, base, home) {
+// Accepts spaces, surrounding quotes, ~ and relative paths ("..", "sub/dir").
+// POSIX: shell-escaped spaces ("Work\ Dir"). Windows: "\" and "/" separators, "C:\x",
+// "C:/x", "\\server\share\x" and "\x" (on the current folder's drive or share); ".."
+// stops at the drive or share. Control characters, Windows' reserved <>:"|?* in names
+// and drive-relative "D:x" are refused.
+// windows: the folder style to use; by default the base folder's style, or the input's
+// when there is no base folder.
+export function resolveInput(input, base, home, windows) {
   let s = String(input ?? "").trim();
   if (s.length >= 2 && (s[0] === '"' || s[0] === "'") && s[s.length - 1] === s[0]) s = s.slice(1, -1);
+  if (/[\u0000-\u001f\u007f]/.test(s)) return null;
+  if (windows ?? (base ? isWindowsPath(base) : isWindowsPath(s))) return resolveWindows(s, base, home);
   s = s.replace(/\\ /g, " ");
   if (!s) return null;
   if (s === "~" || s.startsWith("~/")) {
@@ -52,6 +111,35 @@ export function resolveInput(input, base, home) {
     if (part === "..") out.pop(); else out.push(part);
   }
   return "/" + out.join("/");
+}
+
+function resolveWindows(s, base, home) {
+  if (!s.trim()) return null;
+  s = s.replace(/\//g, "\\");
+  if (s === "~" || /^~[\\/]/.test(s)) {
+    if (!home) return null;
+    s = home + "\\" + s.slice(1);
+  }
+  let root, parts;
+  const abs = splitWindows(s);
+  if (abs) ({ root, parts } = abs);
+  else if (/^[A-Za-z]:/.test(s) || /^[\\/]{2}/.test(s)) return null; // "D:x", or a server without a share
+  else if (/^[\\/]/.test(s)) {
+    const from = splitWindows(base) ?? splitWindows(home);
+    if (!from) return null;
+    root = from.root; parts = [s];
+  } else {
+    const b = splitWindows(base);
+    if (!b) return null;
+    root = b.root; parts = [...b.parts, s];
+  }
+  const out = [];
+  for (const part of parts.join("\\").split(/[\\/]/)) {
+    if (!part || part === ".") continue;
+    if (/[<>:"|?*]/.test(part)) return null;
+    if (part === "..") out.pop(); else out.push(part);
+  }
+  return formatWindows(root, out);
 }
 
 export function utf8Bytes(text) {
@@ -89,7 +177,7 @@ export function rememberedFile(doc, originKey, leavingKey) {
 
 // Entering a context: keep the open document if it is held, or if it is the file that context remembers.
 export function keepsDoc(held, doc, file) {
-  return Boolean(held || (doc && file && doc.path === file.path && (doc.on ?? null) === (file.on ?? null)));
+  return Boolean(held || (doc && file && samePath(doc.path, file.path) && (doc.on ?? null) === (file.on ?? null)));
 }
 
 export const READONLY_LABEL = {

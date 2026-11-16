@@ -6,15 +6,17 @@
 // (mods/files/main.js, Herdr 0.1.15), which is licensed under the Apache License,
 // Version 2.0; see ../../LICENSES/Apache-2.0.txt and ../../THIRD-PARTY-NOTICES.md.
 // Changes from the original, made for herdr-files: a per-space manual root
-// (parent folder, picker, typed path, reset), absolute paths with a "/" root,
-// no folder watch for "/" or the home folder, the open document moved to
+// (parent folder, picker, typed path, reset), absolute POSIX and Windows paths
+// (core.js), folder listing and checks moved to folders.js, no folder watch for
+// a root ("/", "C:\", "\server\share") or the home folder, the open document moved to
 // core.js's DocController (editable state, guarded Save, conflict and deleted
 // handling, unsaved-changes prompt, stale-load tokens), header buttons and
 // banners, Cmd-S/Ctrl-S, and the save and selftest commands.
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, InputState, Input } from "gpui-base";
 import { spaces, panes, focused, exec, readTextFile, writeTextFile, watchFolder, pickFolder, home, theme, settings, window, nextCommand, notify } from "herdr";
-import { DocController, rememberedFile, keepsDoc, joinPath, parentDir, baseName, resolveInput, trimSlash, extension, READONLY_LABEL } from "./core.js";
+import { DocController, rememberedFile, keepsDoc, joinPath, parentDir, baseName, resolveInput, trimSlash, extension, isWindowsPath, isRootPath, samePath, pathKey, READONLY_LABEL } from "./core.js";
+import { makeFolders } from "./folders.js";
 import { selftest } from "./selftest.js";
 
 // Where the focused pane is (the "project folder"), as the shipped panel does it.
@@ -34,30 +36,7 @@ export function makeEditorState({ value, readonly, path }) {
     syntax: { keyword: t.ansi5, string: t.ansi2, comment: t.dim, function: t.ansi4, type: t.ansi3, number: t.ansi1, constant: t.ansi6 } });
 }
 
-async function directory(path, on) {
-  const windowsDirectory = async () => {
-    // Windows PowerShell otherwise uses the console code page; exec decodes UTF-8.
-    // Links keep directory attributes even when dangling; check their target.
-    // Other reparse points (OneDrive's folders) have no LinkType and are folders.
-    // PowerShell reads curly single quotes as quotes too, so they're doubled like '.
-    const r = await exec("powershell", ["-NoProfile", "-Command", "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & { param($p) @(Get-ChildItem -LiteralPath $p -Force -ErrorAction Stop | Where-Object Name -ne '.git' | Select-Object -First 501 | ForEach-Object { @{ name=$_.Name; dir=($_.PSIsContainer -and (-not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not $_.LinkType -or ($_.Target -and [IO.Directory]::Exists(([IO.Path]::Combine([IO.Path]::GetDirectoryName($_.FullName), $_.Target[0])))))) } }) | ConvertTo-Json -Compress } '" + path.replace(/['‘’‚‛]/g, "$&$&") + "'"], { on });
-    if (r.code !== 0) throw new Error(r.stderr || "Cannot list this folder");
-    const result = JSON.parse(r.stdout || "[]");
-    return Array.isArray(result) ? result : [result];
-  };
-  if (!on && window()?.platform === "windows") return windowsDirectory();
-  const script = 'n=0; for p in "$1"/* "$1"/.[!.]* "$1"/..?*; do [ -e "$p" ] || [ -L "$p" ] || continue; name=${p##*/}; [ "$name" = .git ] && continue; if [ -d "$p" ]; then kind=d; else kind=f; fi; printf "%s\\0%s\\0" "$kind" "$name"; n=$((n+1)); [ "$n" -gt 500 ] && break; done; test -d "$1"';
-  let r;
-  try { r = await exec("sh", ["-c", script, "files", path], { on }); }
-  catch (e) {
-    if (on && String(e).includes("cannot start sh: program not found")) return windowsDirectory();
-    throw e;
-  }
-  if (r.code !== 0) throw new Error(r.stderr || "Cannot list this folder");
-  const fields = r.stdout.split("\0"), out = [];
-  for (let i = 0; i + 1 < fields.length; i += 2) out.push({ name: fields[i + 1], dir: fields[i] === "d" });
-  return out;
-}
+const folders = makeFolders({ exec, platform: () => window()?.platform });
 
 export default class Files extends View {
   init(_props, cx) {
@@ -96,7 +75,7 @@ export default class Files extends View {
 
   watch(root, cx) {
     // A whole disk or home is too much to watch; the 10 s timer still refreshes.
-    if (this.on || this.watched === root || root === "/" || root === home()) return;
+    if (this.on || this.watched === root || isRootPath(root) || samePath(root, home())) return;
     this.watched = root;
     const context = this.context;
     cx.spawn(async cx => {
@@ -111,7 +90,7 @@ export default class Files extends View {
 
   async loadFolder(path, context) {
     const { on, cwd: root } = context;
-    const entries = await directory(joinPath(root, path), on);
+    const entries = await folders.list(joinPath(root, path), on);
     if (!this.current(context) || (path && !this.folders.has(path))) return;
     const used = [...this.entries.entries()].filter(([p]) => p !== path).reduce((n, [, e]) => n + e.length, 0);
     this.entries.set(path, entries.slice(0, Math.max(0, Math.min(PER_FOLDER, TOTAL - used))).sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name)));
@@ -130,7 +109,7 @@ export default class Files extends View {
       // An unsaved, saving or conflicted document stays open across space and folder changes,
       // and the file this context remembers is not reopened if it is already open.
       if (keepsDoc(this.docs.held, doc, saved?.file)) {
-        if (saved?.file && doc?.path === saved.file.path) this.docOrigin = next;
+        if (saved?.file && samePath(doc?.path, saved.file.path) && (doc?.on ?? null) === (saved.file.on ?? null)) this.docOrigin = next;
       } else {
         this.docs.close();
         if (saved?.file) this.openFile(saved.file.path, saved.file.on, cx);
@@ -153,7 +132,7 @@ export default class Files extends View {
           const status = await exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"], { cwd, on }).catch(() => null);
           if (status?.code === 0) for (const entry of status.stdout.split("\0").filter(Boolean).slice(0, TOTAL)) {
             const xy = entry.slice(0, 2);
-            marks[joinPath(top.stdout.trim(), entry.slice(3))] = xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";
+            marks[pathKey(joinPath(top.stdout.trim(), entry.slice(3)))] = xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";
           }
         }
         if (!this.current(context)) return;
@@ -218,15 +197,17 @@ export default class Files extends View {
 
   goPath(cx) {
     const on = this.on ?? null, space = paneLocation().space;
-    const target = resolveInput(this.pathInput.value(), this.root, on ? null : home());
+    // Path style follows the shown folder (a remote POSIX folder stays POSIX on Windows).
+    const windows = this.root ? isWindowsPath(this.root) : on ? undefined : window()?.platform === "windows";
+    const target = resolveInput(this.pathInput.value(), this.root, on ? null : home(), windows);
     if (!target) { this.pathError = "Enter a folder path"; cx.notify(); return; }
     this.pathError = null;
     const seq = this.pathSeq = (this.pathSeq ?? 0) + 1;
     cx.spawn(async cx => {
-      const r = await exec("test", ["-d", target], { on }).catch(() => null);
+      const ok = await folders.isFolder(target, on);
       // Dropped if anything moved on meanwhile: another Go, the bar closed, a new root, a file opened.
       if (seq !== this.pathSeq || !this.pathOpen || this.docs.doc || paneLocation().space !== space || (this.on ?? null) !== on) return;
-      if (r?.code === 0) { this.pathOpen = false; this.setRoot(target, cx); }
+      if (ok) { this.pathOpen = false; this.setRoot(target, cx); }
       else this.pathError = `Not a folder: ${target}`;
       cx.notify();
     });
@@ -292,7 +273,7 @@ export default class Files extends View {
     if (out.length >= TOTAL || depth > 40) return out;
     for (const entry of this.entries.get(prefix) ?? []) {
       if (out.length >= TOTAL) break;
-      const path = prefix ? `${prefix}/${entry.name}` : entry.name, open = this.folders.has(path), mark = this.marks[joinPath(this.root, path)];
+      const path = prefix ? `${prefix}/${entry.name}` : entry.name, open = this.folders.has(path), mark = this.marks[pathKey(joinPath(this.root, path))];
       out.push(h_flex().id(`file-${path}`).h(28).flex_none().pl(8 + depth * 18).pr(8).gap(7).items_center().rounded(7).cursor_pointer().hover(s => s.bg(t.hover))
         .on_click((_e, cx) => entry.dir ? this.toggle(path, cx) : this.navigate({ kind: "open", path: joinPath(this.root, path), on: this.on ?? null }, cx))
         .child(entry.dir ? svg(`mods/herdr-files/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())

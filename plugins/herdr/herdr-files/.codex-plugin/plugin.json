@@ -1,6 +1,6 @@
 {
   "name": "herdr-files",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A Files panel for the Herdr app that can go to parent and other folders and edit local Markdown and text files with an explicit, conflict-guarded Save.",
   "author": {
     "name": "gunkr-com",

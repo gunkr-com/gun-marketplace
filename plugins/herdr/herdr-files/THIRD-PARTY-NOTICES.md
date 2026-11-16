@@ -6,7 +6,7 @@ herdr-files is licensed under the MIT License (see [LICENSE](LICENSE)), except f
 
 - `mod/herdr-files/main.js` is a modified version of the `files` mod (`mods/files/main.js`) that ships with the Herdr app (version 0.1.15), https://herdr.dev. The Herdr app is licensed under the Apache License, Version 2.0. The full license text is in [LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt), copied from the app's `LICENSE`.
 - The changes are described at the top of that file. They are licensed under the Apache License 2.0 as part of that file.
-- Original files written for herdr-files (`mod/herdr-files/core.js`, `mod/herdr-files/selftest.js`, the installer, `lib/`, `test/` and `skills/`) are under the MIT License.
+- Original files written for herdr-files (`mod/herdr-files/core.js`, `mod/herdr-files/folders.js`, `mod/herdr-files/selftest.js`, the installer, `lib/`, `test/` and `skills/`) are under the MIT License.
 
 ## Lucide icons: ISC License (with MIT for Feather-derived icons)
 

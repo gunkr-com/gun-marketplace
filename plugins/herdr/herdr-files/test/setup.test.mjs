@@ -1,33 +1,84 @@
 // install / update / status / uninstall against a temporary Herdr home and a stub
 // herdr-app. No running Herdr, no real layouts. The stub records every call so the
 // tests can prove the installer never asks the window to do anything.
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const STUB = `#!/bin/sh
+const { herdrAppCandidates, findHerdrApp } = await import(pathToFileURL(path.join(repo, "lib", "setup.mjs")).href);
+const WIN = process.platform === "win32";
+const EXE = WIN ? "herdr-app.exe" : "herdr-app";
+
+// The stub herdr-app logs every call to $STUB_DIR/calls.log, answers `check` and
+// `status`, and refuses anything else.
+// macOS and Linux: a /bin/sh script. Windows can't spawn a script without a shell, so
+// there it is this Node binary under the name herdr-app.exe (a hard link, else a copy)
+// with a preload in NODE_OPTIONS that acts only in a process with that name; the
+// installer itself runs under the real Node name, so the preload does nothing there.
+// (A copied Node does not run on macOS: Homebrew's links libnode by @rpath.)
+const SH_STUB = `#!/bin/sh
 echo "$*" >> "$STUB_DIR/calls.log"
 case "$1" in
   check)
     [ -f "$STUB_DIR/fail-check" ] && { echo "Error: stub check failed" >&2; exit 1; }
-    [ -f "$2/main.js" ] && [ -f "$2/core.js" ] || exit 1
+    [ -f "$2/main.js" ] && [ -f "$2/core.js" ] && [ -f "$2/folders.js" ] || exit 1
     exit 0 ;;
   status) printf '{"layout":"x","errors":[]}\\n' ;;
   *) echo '{"error":"stub: not allowed"}'; exit 1 ;;
 esac
 `;
+const stubRoot = fs.mkdtempSync(path.join(os.tmpdir(), "hf-stub-"));
+after(() => fs.rmSync(stubRoot, { recursive: true, force: true }));
+const STUB_BIN = path.join(stubRoot, EXE);
+if (!WIN) fs.writeFileSync(STUB_BIN, SH_STUB, { mode: 0o755 });
+else try { fs.linkSync(process.execPath, STUB_BIN); } catch { fs.copyFileSync(process.execPath, STUB_BIN); }
+const PRELOAD = path.join(stubRoot, "stub.mjs");
+if (WIN) fs.writeFileSync(PRELOAD, `import fs from "node:fs";
+import path from "node:path";
+if (/^herdr-app(\\.exe)?$/i.test(path.basename(process.execPath))) {
+  const dir = process.env.STUB_DIR, cmd = path.basename(process.argv[1] ?? ""), args = process.argv.slice(2);
+  fs.appendFileSync(path.join(dir, "calls.log"), [cmd, ...args].join(" ") + "\\n");
+  if (cmd === "check") {
+    if (fs.existsSync(path.join(dir, "fail-check"))) { process.stderr.write("Error: stub check failed\\n"); process.exit(1); }
+    process.exit(["main.js", "core.js", "folders.js"].every((f) => fs.existsSync(path.join(args[0], f))) ? 0 : 1);
+  }
+  if (cmd === "status") { process.stdout.write('{"layout":"x","errors":[]}\\n'); process.exit(0); }
+  process.stdout.write('{"error":"stub: not allowed"}\\n');
+  process.exit(1);
+}
+`);
+const NODE_OPTIONS = WIN ? [process.env.NODE_OPTIONS, `--import=${pathToFileURL(PRELOAD).href}`].filter(Boolean).join(" ") : process.env.NODE_OPTIONS ?? "";
+/** Another name for the stub (a hard link inside the temp folder, else a copy). */
+function placeStub(file) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  try { fs.linkSync(STUB_BIN, file); } catch { fs.copyFileSync(STUB_BIN, file); fs.chmodSync(file, 0o755); }
+  return file;
+}
+/** process.env without any PATH entry (Windows spells it Path), so a test sets its own. */
+const envWithoutPath = () => Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^path$/i.test(k)));
+
 const files = (mod = "files") => ({ id: "files", type: "block", content: { mod } });
 const MAIN = { id: "root", type: "row", children: [{ id: "main", type: "block", content: { tab: "active" } }, { id: "panel", type: "column", children: [{ id: "panel-body", type: "stack", active: "files", children: [files(), { id: "changes", type: "block", content: { mod: "changes" } }] }] }] };
 const MINE = { ...structuredClone(MAIN), cloned_from: { name: "main", version: "0.1.15" }, theme: "graphite" };
 const canRoot = typeof process.getuid === "function" && process.getuid() === 0;
 
+// Makes the next write of a file fail, and returns the undo. POSIX: a read-only folder
+// (rename into it fails). Windows ignores folder modes; a read-only file can't be
+// replaced by a rename.
+function blockWrite(file) {
+  const target = WIN ? file : path.dirname(file);
+  fs.chmodSync(target, WIN ? 0o444 : 0o555);
+  return () => fs.chmodSync(target, WIN ? 0o644 : 0o755);
+}
+
 function sandbox({ selected = "mine" } = {}) {
-  const home = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "hf-setup-"));
+  // A space, an apostrophe and Unicode in every path the installer handles.
+  const home = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "hf-setup it's 폴더-"));
   const app = path.join(home, "herdr-home");
   fs.mkdirSync(path.join(app, "mods", "files"), { recursive: true });
   fs.mkdirSync(path.join(app, "layouts"));
@@ -38,8 +89,7 @@ function sandbox({ selected = "mine" } = {}) {
   write("shared.json", { layout: selected });
   const stubDir = path.join(home, "stub");
   fs.mkdirSync(stubDir);
-  fs.writeFileSync(path.join(stubDir, "herdr-app"), STUB, { mode: 0o755 });
-  const env = { ...process.env, HOME: home, HERDR_APP_HOME: app, HERDR_APP_BIN: path.join(stubDir, "herdr-app"), STUB_DIR: stubDir };
+  const env = { ...process.env, HOME: home, USERPROFILE: home, HERDR_APP_HOME: app, HERDR_APP_BIN: STUB_BIN, STUB_DIR: stubDir, NODE_OPTIONS };
   return { home, app, stubDir, env, write, layout: (n) => path.join(app, "layouts", `${n}.json`), mod: path.join(app, "mods", "herdr-files"), state: path.join(app, "herdr-files") };
 }
 const run = (s, script, args = []) => spawnSync(process.execPath, [path.join(repo, script), ...args], { env: s.env, encoding: "utf8" });
@@ -70,7 +120,7 @@ test("default: patches the selected personal layout, idempotent, round trip, nev
   assert.equal(json(s.layout("mine")).theme, "graphite", "rest of the layout kept");
   assert.equal(read(s.layout("main")), mainBefore, "shipped layout untouched");
   assert.match(read(path.join(s.mod, "core.js")), /PACKAGE = "herdr-files"/);
-  assert.ok(fs.existsSync(path.join(s.mod, "main.js")) && fs.existsSync(path.join(s.mod, "folder.svg")));
+  assert.ok(fs.existsSync(path.join(s.mod, "main.js")) && fs.existsSync(path.join(s.mod, "folders.js")) && fs.existsSync(path.join(s.mod, "folder.svg")));
   const info = json(path.join(s.state, "install.json"));
   assert.equal(info.package, "herdr-files");
   assert.equal(info.layouts.mine.previous, "files");
@@ -173,13 +223,13 @@ test("layout write failure: everything rolled back, the previous mod restored", 
   assert.equal(run(s, "install.mjs", ["--no-layout"]).status, 0);
   fs.writeFileSync(path.join(s.mod, "previous.txt"), "previous build");
   const before = tree(s.app);
-  fs.chmodSync(path.join(s.app, "layouts"), 0o555);
+  const unblock = blockWrite(s.layout("mine"));
   try {
     const r = run(s, "install.mjs");
     assert.equal(r.status, 1, r.stdout);
     assert.match(r.stderr, /failed while applying/);
     assert.match(r.stderr, /put back as it was/);
-  } finally { fs.chmodSync(path.join(s.app, "layouts"), 0o755); }
+  } finally { unblock(); }
   assert.deepEqual(tree(s.app), before, "layout, previous mod, state and backups as before");
 });
 
@@ -188,12 +238,12 @@ test("install.json write failure after the layout was written: layout and backup
   assert.equal(run(s, "install.mjs", ["--no-layout"]).status, 0);
   fs.mkdirSync(path.join(s.state, "backups"));
   const before = tree(s.app);
-  fs.chmodSync(s.state, 0o555);
+  const unblock = blockWrite(path.join(s.state, "install.json"));
   try {
     const r = run(s, "install.mjs");
     assert.equal(r.status, 1, r.stdout);
     assert.match(r.stderr, /put back as it was/);
-  } finally { fs.chmodSync(s.state, 0o755); }
+  } finally { unblock(); }
   assert.deepEqual(tree(s.app), before, "layout restored, backup removed, install.json unchanged");
 });
 
@@ -289,4 +339,62 @@ test("generated gpui-shell helpers in a checkout are not installed", () => {
     assert.equal(fs.existsSync(path.join(s.mod, "jsconfig.json")), false);
     assert.ok(fs.existsSync(path.join(s.mod, "main.js")));
   } finally { for (const f of made) fs.rmSync(path.join(modSrc, f), { force: true }); }
+});
+
+test("herdr-app install locations per platform", () => {
+  assert.deepEqual(herdrAppCandidates({ platform: "win32", env: { LOCALAPPDATA: "D:\\Local" }, home: "C:\\Users\\me" }), [
+    "D:\\Local\\Programs\\herdr-app\\herdr-app.exe", "D:\\Local\\herdr-app\\herdr-app.exe", "C:\\Users\\me\\.local\\bin\\herdr-app.exe"]);
+  assert.equal(herdrAppCandidates({ platform: "win32", env: {}, home: "C:\\Users\\me" })[0], "C:\\Users\\me\\AppData\\Local\\Programs\\herdr-app\\herdr-app.exe", "no LOCALAPPDATA: under the profile");
+  assert.deepEqual(herdrAppCandidates({ platform: "linux", env: {}, home: "/home/me" }), ["/home/me/.local/bin/herdr-app"]);
+  assert.deepEqual(herdrAppCandidates({ platform: "darwin", env: {}, home: "/Users/me" }), [
+    "/Users/me/.local/bin/herdr-app", "/Applications/Herdr.app/Contents/MacOS/Herdr", "/Users/me/Applications/Herdr.app/Contents/MacOS/Herdr"]);
+});
+
+test("finds herdr-app on PATH without HERDR_APP_BIN (herdr-app.exe on Windows, not the extensionless script; quoted PATH entry)", () => {
+  const s = sandbox();
+  const bin = path.join(s.home, "bin dir");
+  const exe = placeStub(path.join(bin, EXE));
+  if (WIN) fs.writeFileSync(path.join(bin, "herdr-app"), "#!/bin/sh\nexit 1\n"); // Git Bash wrapper beside the .exe
+  const env = { ...envWithoutPath(), HOME: s.home, USERPROFILE: s.home, HERDR_APP_HOME: s.app, STUB_DIR: s.stubDir, NODE_OPTIONS, PATH: WIN ? `"${bin}"` : bin }; // Windows: a quoted entry, as setx and installers can write
+  const r = spawnSync(process.execPath, [path.join(repo, "install.mjs"), "--no-layout"], { env, encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(json(path.join(s.state, "install.json")).herdr_app, exe);
+  assert.match(read(path.join(s.stubDir, "calls.log")), /^check /m);
+});
+
+test("Windows: finds herdr-app.exe where Herdr's installer puts it (%LOCALAPPDATA%\\Programs\\herdr-app)", { skip: !WIN && "Windows only" }, () => {
+  const s = sandbox();
+  const local = path.join(s.home, "AppData Local");
+  const exe = placeStub(path.join(local, "Programs", "herdr-app", "herdr-app.exe"));
+  const empty = path.join(s.home, "empty");
+  fs.mkdirSync(empty);
+  const env = { ...envWithoutPath(), HOME: s.home, USERPROFILE: s.home, LOCALAPPDATA: local, HERDR_APP_HOME: s.app, STUB_DIR: s.stubDir, NODE_OPTIONS, PATH: empty };
+  const r = spawnSync(process.execPath, [path.join(repo, "install.mjs")], { env, encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(json(path.join(s.state, "install.json")).herdr_app, exe);
+  assert.equal(filesMod(s.layout("mine")), "herdr-files");
+  const st = spawnSync(process.execPath, [path.join(repo, "status.mjs"), "--json"], { env, encoding: "utf8" });
+  assert.equal(JSON.parse(st.stdout).installed, true, st.stderr);
+  assert.equal(spawnSync(process.execPath, [path.join(repo, "uninstall.mjs")], { env, encoding: "utf8" }).status, 0);
+  assert.equal(fs.existsSync(s.mod), false);
+  assert.deepEqual(windowCalls(s), []);
+});
+
+// The real herdr-app checks the staged mod (it loads main.js, core.js, folders.js and
+// selftest.js in a hidden window) against a temporary Herdr home; the person's own Herdr
+// home and window are not used. Runs where Herdr is installed on Windows.
+const realApp = WIN ? findHerdrApp() : null;
+test("Windows, real herdr-app: install round trip in a temporary Herdr home", { skip: !realApp && "needs Herdr on Windows" }, () => {
+  const s = sandbox();
+  const env = { ...s.env, HERDR_APP_BIN: realApp };
+  delete env.NODE_OPTIONS;
+  const original = read(s.layout("mine"));
+  const r = spawnSync(process.execPath, [path.join(repo, "install.mjs")], { env, encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr + r.stdout);
+  assert.equal(filesMod(s.layout("mine")), "herdr-files");
+  for (const f of ["main.js", "core.js", "folders.js", "selftest.js", "mod.json"]) assert.ok(fs.existsSync(path.join(s.mod, f)), f);
+  const u = spawnSync(process.execPath, [path.join(repo, "uninstall.mjs")], { env, encoding: "utf8" });
+  assert.equal(u.status, 0, u.stderr);
+  assert.deepEqual(json(s.layout("mine")), JSON.parse(original));
+  assert.equal(fs.existsSync(s.mod), false);
 });

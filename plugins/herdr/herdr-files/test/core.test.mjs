@@ -72,6 +72,101 @@ test("resolveInput: spaces, quotes, escapes, ~, relative, ..", () => {
   assert.equal(resolveInput("rel", null, home), null);
 });
 
+test("Windows paths: drive and UNC roots, both separators, parent, base name", () => {
+  const { isWindowsPath, isRootPath, pathKey, samePath, extension } = core;
+  for (const p of ["C:\\", "C:/", "c:", "C:\\Users", "D:/x/y", "\\\\srv\\share", "\\\\srv/share/x", "\\\\?\\C:\\x", "\\\\?\\UNC\\srv\\share"]) assert.ok(isWindowsPath(p), p);
+  for (const p of ["/", "/Users/me", "rel", "C:rel", "\\\\srv", "//srv", "//tmp/dir", "//srv/share/x", "", null]) assert.ok(!isWindowsPath(p), String(p));
+  assert.equal(trimSlash("C:\\Users\\me\\\\"), "C:\\Users\\me");
+  assert.equal(trimSlash("c:/Users/me/"), "C:\\Users\\me", "slashes and drive case normalized");
+  assert.equal(trimSlash("C:"), "C:\\", "a bare drive is its root, not drive-relative");
+  assert.equal(trimSlash("C:/"), "C:\\");
+  assert.equal(trimSlash("\\\\srv\\share\\"), "\\\\srv\\share");
+  assert.equal(joinPath("C:", ""), "C:\\", "the shown folder itself: a drive root, never drive-relative C:");
+  assert.equal(joinPath("c:/Users/me/", ""), "C:\\Users\\me");
+  assert.equal(trimSlash("\\\\?\\UNC\\srv\\share\\x"), "\\\\srv\\share\\x");
+  assert.equal(trimSlash("\\\\?\\D:\\x"), "D:\\x");
+  assert.equal(joinPath("C:\\", "a b/c.md"), "C:\\a b\\c.md");
+  assert.equal(joinPath("C:\\x", "a"), "C:\\x\\a");
+  assert.equal(joinPath("\\\\srv\\share", "a/b"), "\\\\srv\\share\\a\\b");
+  assert.equal(joinPath("E:/Shared Docs/repo", "sub/f.md"), "E:\\Shared Docs\\repo\\sub\\f.md", "git's forward-slash top level");
+  assert.equal(parentDir("C:\\Users\\me"), "C:\\Users");
+  assert.equal(parentDir("C:\\Users"), "C:\\");
+  assert.equal(parentDir("C:\\"), null);
+  assert.equal(parentDir("\\\\srv\\share\\sub"), "\\\\srv\\share");
+  assert.equal(parentDir("\\\\srv\\share"), null, "never above the share");
+  assert.equal(baseName("C:\\a\\Work Dir\\"), "Work Dir");
+  assert.equal(baseName("C:\\"), "C:\\");
+  assert.equal(baseName("\\\\srv\\share"), "\\\\srv\\share");
+  assert.ok(isRootPath("C:\\") && isRootPath("D:/") && isRootPath("\\\\srv\\share\\") && isRootPath("/"));
+  assert.ok(!isRootPath("C:\\x") && !isRootPath("/x"));
+  assert.equal(extension("C:\\dir.md\\README"), "txt", "a dotted folder does not make an extension");
+  assert.equal(extension("C:\\a\\Notes.MD"), "md");
+  assert.equal(classify("C:\\dir.md\\README", "x", null).readonly, null, "extensionless stays editable");
+  assert.equal(classify("C:\\a\\b.js", "x", null).readonly, "preview");
+  assert.ok(samePath("c:/Users/Me/", "C:\\users\\me"), "Windows: case and separators ignored");
+  assert.ok(!samePath("/Users/Me", "/users/me"), "POSIX: case matters");
+  assert.equal(pathKey("E:/Shared Docs/x/a.md"), pathKey("e:\\shared docs\\x\\a.md"), "git marks match the panel's paths");
+  // POSIX paths keep "\" as part of a name.
+  assert.equal(baseName("/a/b\\c.md"), "b\\c.md");
+  assert.equal(parentDir("/a/b\\c"), "/a");
+});
+
+test("resolveInput, Windows: absolute, relative, .., ~, quotes, roots, refusals", () => {
+  const base = "C:\\Users\\me\\Work Dir", home = "C:\\Users\\me";
+  assert.equal(resolveInput("D:\\data\\x", base, home), "D:\\data\\x", "drive path is absolute, not relative");
+  assert.equal(resolveInput("d:/data/x/", base, home), "D:\\data\\x");
+  assert.equal(resolveInput('"E:\\Shared Docs\\it\'s 폴더"', base, home), "E:\\Shared Docs\\it's 폴더", "Explorer's quoted copy");
+  assert.equal(resolveInput("'C:\\a b'", base, home), "C:\\a b");
+  assert.equal(resolveInput("C:\\a\\ b", base, home), "C:\\a\\ b", "\\ is a separator, not an escape");
+  assert.equal(resolveInput("sub\\deeper/x", base, home), "C:\\Users\\me\\Work Dir\\sub\\deeper\\x");
+  assert.equal(resolveInput("..", base, home), "C:\\Users\\me");
+  assert.equal(resolveInput("..\\..\\..\\..\\..", base, home), "C:\\", ".. stops at the drive");
+  assert.equal(resolveInput(".", base, home), base);
+  assert.equal(resolveInput("\\Windows", base, home), "C:\\Windows", "root-relative: the current drive");
+  assert.equal(resolveInput("/", base, home), "C:\\");
+  assert.equal(resolveInput("~", base, home), "C:\\Users\\me");
+  assert.equal(resolveInput("~\\dev", base, home), "C:\\Users\\me\\dev");
+  assert.equal(resolveInput("~/dev", base, home), "C:\\Users\\me\\dev");
+  assert.equal(resolveInput("~", base, null), null, "remote: no local ~");
+  assert.equal(resolveInput("\\\\srv\\share\\a\\..\\..\\..", base, home), "\\\\srv\\share", ".. stops at the share");
+  assert.equal(resolveInput("x", "\\\\srv\\share", home), "\\\\srv\\share\\x");
+  assert.equal(resolveInput("//srv/share/a", base, home), "\\\\srv\\share\\a", "forward-slash UNC once the folder is Windows");
+  assert.equal(resolveInput("\\top", "\\\\srv\\share\\a", home), "\\\\srv\\share\\top");
+  assert.equal(resolveInput("C:rel", base, home), null, "drive-relative refused");
+  assert.equal(resolveInput("\\\\srv", base, home), null, "server without share refused");
+  assert.equal(resolveInput("C:\\a|b", base, home), null, "reserved character refused");
+  assert.equal(resolveInput("C:\\a\nb", base, home), null, "control character refused");
+  assert.equal(resolveInput("C:\\a\u0000b", base, home), null);
+  assert.equal(resolveInput("rel", null, home, true), null, "no base folder: relative refused");
+  assert.equal(resolveInput("C:\\x", null, home), "C:\\x", "no base folder: the input's style");
+  assert.equal(resolveInput("\\x", null, home, true), "C:\\x", "no base folder on Windows: home's drive");
+});
+
+test("resolveInput: a remote POSIX folder keeps POSIX rules on a Windows host", () => {
+  // main.js passes windows = isWindowsPath(root) when a folder is shown, and home only locally.
+  const root = "/Users/me/dev";
+  assert.equal(resolveInput("..", root, null, false), "/Users/me");
+  assert.equal(resolveInput("Work\\ Dir/x", root, null, false), "/Users/me/dev/Work Dir/x", "shell escape still unescaped");
+  assert.equal(resolveInput("/opt/x", root, null, false), "/opt/x");
+  assert.equal(resolveInput("~/x", root, null, false), null);
+  assert.equal(resolveInput("../..", root, null), "/Users", "default style is the base folder's");
+  assert.equal(resolveInput("/a/b\nc", root, null), null, "control characters refused for POSIX too");
+  // POSIX "//": not a UNC share, with or without a shown folder.
+  assert.equal(resolveInput("//tmp/dir", null, null), "/tmp/dir");
+  assert.equal(resolveInput("//tmp/dir", root, null), "/tmp/dir");
+  assert.equal(trimSlash("//tmp/dir/"), "//tmp/dir");
+  assert.equal(parentDir("//tmp/dir"), "//tmp");
+  assert.equal(core.isRootPath("//tmp/dir"), false);
+});
+
+test("keepsDoc: the remembered file matches across Windows case and separators", () => {
+  const doc = { path: "C:\\Users\\me\\a.md", on: null };
+  assert.equal(keepsDoc(false, doc, { path: "c:/users/me/a.md", on: null }), true);
+  assert.equal(keepsDoc(false, doc, { path: "C:\\Users\\me\\b.md", on: null }), false);
+  assert.equal(keepsDoc(false, doc, { path: "C:\\Users\\me\\a.md", on: "box" }), false, "another machine is another file");
+  assert.equal(keepsDoc(false, { path: "/a/A.md", on: null }, { path: "/a/a.md", on: null }), false, "POSIX case matters");
+});
+
 test("classify: editable only for local, whole, Markdown/text", () => {
   assert.equal(classify("/a.md", "x", null).readonly, null);
   assert.equal(classify("/a.markdown", "x", null).readonly, null);

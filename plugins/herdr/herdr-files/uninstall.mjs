@@ -57,12 +57,12 @@ if (failed || leftover.length || unreadable.length) {
     else {
       // Give a running Herdr a moment to reload the restored layouts first.
       if (restored) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500);
-      fs.rmSync(P.mod, { recursive: true, force: true });
+      fs.rmSync(P.mod, { recursive: true, force: true, maxRetries: 5 });
       log(`mod ${MOD} removed`);
     }
   }
   if (fs.existsSync(P.state)) {
-    fs.rmSync(P.state, { recursive: true, force: true });
+    fs.rmSync(P.state, { recursive: true, force: true, maxRetries: 5 });
     log(`${P.state} removed`);
   }
 }

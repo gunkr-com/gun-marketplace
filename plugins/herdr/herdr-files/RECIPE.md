@@ -9,7 +9,7 @@ Herdr's Files panel shows only the focused pane's folder and previews files read
 ## Pieces
 
 1. **Mod** (`mod/herdr-files`). It starts from Herdr's shipped `files` mod, cloned and modified; the shipped mod stays untouched.
-   - **Tree view.** The header has `↑` (parent), `Open…` (`pickFolder`, local only), `Path` (an `InputState`; the path is resolved and checked with `test -d` before switching) and `Project` (clears the manual root). Below the header is a line with the full root path. The manual root is kept per space id, as `{cwd, on}`, in the mod's `localStorage`.
+   - **Tree view.** The header has `↑` (parent), `Open…` (`pickFolder`, local only), `Path` (an `InputState`; the path is resolved by `core.js` in the shown folder's style, POSIX or Windows, and checked by `folders.js` before switching: `test -d`, or PowerShell for a Windows folder) and `Project` (clears the manual root). Below the header is a line with the full root path. The manual root is kept per space id, as `{cwd, on}`, in the mod's `localStorage`.
      - The panel's context key includes the manual root, so terminal `cd`s don't move it.
      - There is no `watchFolder` on `/` or on the home folder.
      - `joinPath` handles the `/` root.
@@ -28,7 +28,8 @@ Herdr's Files panel shows only the focused pane's folder and previews files read
        - overwrite against the disk snapshot it just read; recreate with `expected = null`
        - `request()` and `resolve()` for navigation, refused while a save is writing
      - `rememberedFile()` and `keepsDoc()`: a held document stays open across context switches, and is never remembered by a context it was not opened in.
-   - **`selftest.js`**: the `herdr-files.selftest` command. It drives a separate `DocController` with the real APIs in a fresh `mktemp -d /tmp/herdr-files-selftest.XXXXXX` and reports with `notify` and a `result.json`.
+   - **`selftest.js`**: the `herdr-files.selftest` command. It drives a separate `DocController` with the real APIs in a fresh scratch folder (`mktemp -d /tmp/herdr-files-selftest.XXXXXX`, or PowerShell under `%TEMP%` on Windows) and reports with `notify` and a `result.json`.
+   - **`folders.js`**: folder listing, the folder check and the self-test's folder setup through `exec`, with no herdr import so Node tests drive it. POSIX: `sh`, `test`, `mktemp`, `mkdir`, `rm`. Windows (here, or a remote folder with a Windows path): Windows PowerShell with .NET calls, the path passed as UTF-8 Base64.
 2. **Installer**:
    - **Checks first:** platform, Node.js, Herdr home, `herdr-app`, mod and state ownership, the target layout, and `herdr-app check` of the staged mod.
    - **Target layout:** `--layout`, or else the selected one from `shared.json`. Herdr's own layouts (`installed.json` keys `layout:<name>`) are refused; `--create-layout` writes a new personal copy instead.
