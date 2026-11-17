@@ -22,8 +22,9 @@ This is an independent personal project. It is not affiliated with, endorsed by,
 | [herdr](plugins/herdr) | [`herdr-bg-status`](plugins/herdr/herdr-bg-status) | Keeps a session shown as working in [herdr](https://herdr.dev) while its background shells, agents or backgrounded MCP calls still run after the turn ends | Terminal, inside herdr |
 | [herdr](plugins/herdr) | [`herdr-usage`](plugins/herdr/herdr-usage) | Shows Codex, Claude Code, Antigravity and Ollama Cloud subscription usage in the Herdr app's status bar, with a detail popup, in English or Korean. Its skill installs it when you ask; also for Codex | The Herdr app (macOS, Linux, Windows) |
 | [herdr](plugins/herdr) | [`herdr-files`](plugins/herdr/herdr-files) | Lets the Herdr app's Files panel go to parent and other folders, and edit local Markdown and text files with an explicit, conflict-guarded Save. Its skill installs it when you ask; also for Codex | The Herdr app (macOS, Linux, Windows) |
+| [harnesses](plugins/harnesses) | [`cab-of-one`](plugins/harnesses/README.md#cab-of-one) | Preview. An interview-led generator that writes change control for IT operations into a Claude Code project as hooks and deny rules; you apply the result from your own terminal. Snapshots, verification and allowed writes use only the simulated tenant, and writes to a real tenant are refused; classified reads from a real tenant remain allowed. Installed from its own repository, [`gunkr-com/cab-of-one`](https://github.com/gunkr-com/cab-of-one) (Apache-2.0) | Claude Code (macOS, Linux) |
 
-Each category's README has the details, options and requirements: [mods](plugins/mods/README.md), [herdr](plugins/herdr/README.md).
+Each category's README has the details, options and requirements: [mods](plugins/mods/README.md), [herdr](plugins/herdr/README.md), [harnesses](plugins/harnesses/README.md).
 
 ### Install Claude Code plugins
 
@@ -76,7 +77,7 @@ Options you set (`/plugin configure`) belong to the old plugin name, so set them
 
 ### License
 
-[MIT](LICENSE)
+[MIT](LICENSE), except plugins installed from their own repositories (such as `cab-of-one`), which follow their own license.
 
 ---
 
@@ -94,8 +95,9 @@ Options you set (`/plugin configure`) belong to the old plugin name, so set them
 | [herdr](plugins/herdr) | [`herdr-bg-status`](plugins/herdr/herdr-bg-status) | 턴이 끝난 뒤에도 백그라운드 셸·에이전트·백그라운드로 넘어간 MCP 호출이 돌고 있으면 [herdr](https://herdr.dev)에서 세션을 working으로 계속 표시 | 터미널(herdr 안) |
 | [herdr](plugins/herdr) | [`herdr-usage`](plugins/herdr/herdr-usage) | Codex, Claude Code, Antigravity, Ollama Cloud 구독 사용량을 Herdr 앱 하단 바와 상세 팝업에 영어나 한국어로 표시. 요청하면 플러그인의 스킬이 설치함. Codex용도 있음 | Herdr 앱(macOS, Linux, Windows) |
 | [herdr](plugins/herdr) | [`herdr-files`](plugins/herdr/herdr-files) | Herdr 앱 Files 패널에서 상위·다른 폴더로 이동하고, 로컬 Markdown·텍스트 파일을 편집해 확인을 거쳐 저장. 요청하면 플러그인의 스킬이 설치함. Codex용도 있음 | Herdr 앱(macOS, Linux, Windows) |
+| [harnesses](plugins/harnesses) | [`cab-of-one`](plugins/harnesses/README.md#cab-of-one) | 미리보기. 인터뷰로 IT 운영용 변경 통제(change control)를 Claude Code 프로젝트의 훅과 deny 규칙으로 생성하며, 결과는 내 터미널에서 직접 적용함. 스냅샷·검증·허용된 쓰기는 시뮬레이션 테넌트에서만 하고 실제 테넌트 쓰기는 거부함. 분류된 실제 테넌트 읽기는 허용됨. 자체 저장소 [`gunkr-com/cab-of-one`](https://github.com/gunkr-com/cab-of-one)(Apache-2.0)에서 설치됨 | Claude Code(macOS, Linux) |
 
-자세한 설명, 옵션, 요구 사항은 분류별 README에 있습니다: [mods](plugins/mods/README.md), [herdr](plugins/herdr/README.md).
+자세한 설명, 옵션, 요구 사항은 분류별 README에 있습니다: [mods](plugins/mods/README.md), [herdr](plugins/herdr/README.md), [harnesses](plugins/harnesses/README.md).
 
 ### Claude Code 플러그인 설치
 
@@ -148,4 +150,4 @@ claude plugin marketplace remove claude-mod-repo
 
 ### 라이선스
 
-[MIT](LICENSE)
+[MIT](LICENSE). 단, 자체 저장소에서 설치되는 플러그인(`cab-of-one` 등)은 그 저장소의 라이선스를 따릅니다.
