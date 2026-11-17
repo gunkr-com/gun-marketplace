@@ -4,7 +4,7 @@
     "name": "gunkr-com"
   },
   "metadata": {
-    "description": "Claude Code plugins by gunkr-com, grouped by category: mods that change how Claude Code looks and behaves, and herdr integrations"
+    "description": "Claude Code plugins by gunkr-com, grouped by category: mods that change how Claude Code looks and behaves, herdr integrations, and harnesses kept in their own repositories"
   },
   "plugins": [
     {
@@ -54,6 +54,17 @@
       "source": "./plugins/herdr/herdr-files",
       "category": "herdr",
       "description": "A Files panel for the Herdr app that goes to parent and other folders and edits local Markdown and text files with an explicit, conflict-guarded Save; its skill installs, checks and removes it"
+    },
+    {
+      "name": "cab-of-one",
+      "source": {
+        "source": "github",
+        "repo": "gunkr-com/cab-of-one"
+      },
+      "category": "harnesses",
+      "description": "Preview: an interview-led generator that writes change control for IT operations into a Claude Code project as hooks and deny rules; a person applies the result from their own terminal. Snapshots, verification and allowed writes use only the simulated tenant and real-tenant writes are refused; classified real-tenant reads remain allowed. Source lives in its own repository (Apache-2.0)",
+      "license": "Apache-2.0",
+      "homepage": "https://github.com/gunkr-com/cab-of-one"
     }
   ]
 }
