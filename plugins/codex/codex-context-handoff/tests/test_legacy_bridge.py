@@ -79,6 +79,10 @@ class LegacyBridgeTests(test_context_handoff.GoalTransferTests):  # not bound he
         note = self.state.with_suffix(".md").read_text()
         self.assertIn("written by Codex Context Handoff 0.5.0", note)
         self.assertIn("1. First, before anything else, call create_goal exactly", note)
+        checklist = note.split("## Restore checklist")[1]
+        self.assertEqual(note.count(handoff.WORKER_CLEANUP_RULE), 1)
+        self.assertLess(checklist.index("call create_goal"), checklist.index(handoff.WORKER_CLEANUP_RULE))
+        self.assertLess(checklist.index(handoff.WORKER_CLEANUP_RULE), checklist.index("restored --token"))
         self.assertIn(f"Read token (revision 0): {handoff.read_token(secret, 0)}", note)
         restore = json.loads((self.root / "fresh" / ".goal-restore").read_text())
         self.assertEqual((restore["objective"], restore["remaining"]), (OBJECTIVE, 141764))

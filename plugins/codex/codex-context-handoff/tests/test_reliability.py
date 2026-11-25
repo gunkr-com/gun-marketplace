@@ -64,6 +64,28 @@ WORLD = world(
 )
 
 
+
+RULE_PHRASES = (
+    "still active (status working, blocked or error, or no status)", "the user pinned it or asked to keep it",
+    "task or attempt that is still active", "another owner manages it", "lifecycle is genuinely ambiguous",
+    "are not a retention reason by themselves", "concrete pending use named in --reason", "\"might be useful\"",
+    "Close a done or idle worker only when it has neither a concrete pending use nor a retention reason",
+    "A retention reason wins over a close", "is kept even when this chat has no next message for it",
+    "--result naming where it is",
+    "never use hc kill, hc rm, kill or any other tool", "run `workers` once more and retry once",
+    "keep the worker with the refusal as the reason", "A screen-only snapshot", "complete read",
+    "no saved evidence after a second `workers`",
+)
+
+
+def assert_cleanup_rule(test, text):
+    """The single worker cleanup rule (0.6.2), as every entry point states it."""
+    for phrase in RULE_PHRASES:
+        test.assertIn(phrase, text)
+    test.assertNotIn("--cancel-working", text)
+    test.assertNotIn("protected", text)
+
+
 class Base(unittest.TestCase):
     setUp = shared["setUp"]
     write_events = shared["write_events"]
@@ -514,6 +536,24 @@ class SwitchTests(Base):
         self.deliver(REPORT_TEXT, session="session")
         self.assertEqual(handoff.held_count(self.state), 1)
 
+    def test_a_retry_keeps_one_checklist_and_the_pinned_continuation(self):
+        self.clock.at(1.2, lambda: (self.deliver(REPORT_TEXT, session="session"), self.term.set(screen=HELD_OLD, turn=6)))
+        self.run_switch()
+        self.assertEqual([a["kind"] for a in self.ledger()["attempts"]], ["request", "switch"])
+        note = self.state.with_suffix(".md").read_text()
+        self.assertEqual(note.count("## Restore checklist"), 1)
+        self.assertEqual(note.count(handoff.WORKER_CLEANUP_RULE), 1)
+        assert_cleanup_rule(self, note.split("## Restore checklist")[1])
+        self.assertIn(f"Read token (revision 1): {handoff.read_token(self.secret, 1)}", note)
+        pinned = (  # 0.6.1, verbatim: a switch started by 0.6.1 sends this and the newer hooks must accept it
+            f"Codex Context Handoff: session turn {'a' * 24} Read the local handoff note at "
+            f"{json.dumps(str(self.state.with_suffix('.md')))} and follow its restore checklist (run its helper "
+            "commands with exec_command and login: false). Check the working tree and live Herdr workers before "
+            "resuming the remaining work. Preserve the user's scope and decisions."
+        )
+        self.assertEqual([s for s in self.sends if s.startswith("Codex Context Handoff:")], [pinned])
+        self.assertEqual(self.state.with_suffix(".received").read_text(), "fresh\n")
+
     def test_worker_message_after_clear_is_held_and_the_same_fresh_chat_is_used(self):
         def keys():
             self.term.set(screen=FRESH, status="working")
@@ -765,6 +805,38 @@ class RestoreTests(Base):
             with self.assertRaisesRegex(handoff.Refusal, "HC_TERMINAL_ID is missing.*login: false"):
                 handoff.helper_context(self.root)
 
+    def test_the_checklist_states_the_worker_cleanup_rule(self):
+        for transfer in (False, True):
+            with self.subTest(transfer=transfer):
+                checklist = handoff.restore_checklist(self.state, self.secret, transfer)
+                order = [checklist.index("Read this whole note"), checklist.index("context-handoff workers`"),
+                         checklist.index(handoff.WORKER_CLEANUP_RULE), checklist.index("workers done`"),
+                         checklist.index("restored --token")]
+                if transfer:
+                    order.insert(0, checklist.index("call create_goal"))
+                self.assertEqual(order, sorted(order))
+                assert_cleanup_rule(self, checklist)
+                self.assertEqual(checklist.count("create_goal"), 1 if transfer else 0)
+                self.assertIn("finished workers keep their history in Herdr", checklist)
+
+    def test_the_stop_reminder_and_status_summarize_the_rule(self):
+        self.state.with_suffix(".workers.json").write_text(json.dumps({"workers": [{"address": "t2", "parent": "t1"}]}))
+        summary = handoff.WORKER_CLEANUP_SUMMARY
+        for phrase in ("keep active workers", "any worker with a concrete retention reason, even a done or idle one "
+                       "with no next message", "reuse only for a concrete pending use", "close only a done or idle "
+                       "worker with neither a pending use nor a retention reason", "never with hc kill, hc rm, kill",
+                       "retried once after a fresh `workers`, then kept with the refusal as the reason"):
+            self.assertIn(phrase, summary)
+        self.assertNotIn("--cancel-working", summary)
+        first = self.stop()
+        self.assertIn("review the Herdr workers (", first["reason"])
+        self.assertIn(summary, first["reason"])
+        self.assertIn(summary, "; ".join(handoff.helper_status(self.ctx)["missing"]))
+        with self.assertRaises(handoff.Refusal) as refused:
+            handoff.confirm_restored(self.ctx, handoff.read_token(self.secret, 0))
+        self.assertIn("review the Herdr workers (", str(refused.exception))
+        self.assertIn(summary, str(refused.exception))
+
     def test_the_helpers_refuse_before_the_transferred_goal_is_recreated(self):
         transcript = self.root / "home" / "sessions" / "2026" / "11" / "14" / "rollout-x-fresh.jsonl"
         transcript.parent.mkdir(parents=True)
@@ -847,6 +919,14 @@ class WorkerReviewTests(Base):
         self.assertEqual(result["undecided"], ["t3", "t4"])
         evidence = next(row for row in result["workers"] if row["address"] == "t3")["evidence"]
         self.assertIn("screen of t3", Path(evidence["path"]).read_text())
+
+    def test_inspect_next_states_the_cleanup_rule(self):
+        self.capture()
+        result = self.call(handoff.workers_inspect)
+        self.assertTrue(result["next"].startswith("Read each worker's result"))
+        assert_cleanup_rule(self, result["next"])
+        self.assertEqual(set(result), {"handoff", "terminal", "workers", "new_workers_not_in_review", "undecided",
+                                       "next"})
 
     def test_close_is_guarded_and_idempotent(self):
         self.capture()
@@ -1443,6 +1523,35 @@ class CoreReviewWorkerTests(WorkerReviewTests):
         self.state.with_suffix(".restore.json").write_text(json.dumps({"secret": secret}))
         self.ctx["folder"].mkdir()
         self.assertTrue(handoff.confirm_restored(self.ctx, handoff.read_token(secret, 0))["restored"])
+
+    def test_a_refused_close_issues_no_kill_and_keep_completes_the_review(self):
+        # t2 is done, but Herdr reads only its screen completely: the review has evidence, a close does not.
+        original, calls = self.fake_hc, []
+        def screen_only(*args, timeout=8):
+            calls.append(args[0])
+            if args[0] == "read":
+                screen = args[args.index("--lines") + 1] == "0"
+                return {"complete": screen, "text": f"{args[-1]} screen" if screen else ""}
+            return original(*args, timeout=timeout)
+        self.capture()
+        with patch.object(handoff, "hc", side_effect=screen_only):
+            evidence = {row["address"]: row["evidence"] for row in handoff.workers_inspect(self.ctx)["workers"]
+                        if row.get("evidence")}
+            self.assertEqual((evidence["t2"]["scope"], evidence["t2"]["partial_history"]), ("screen", True))
+            refusals = []
+            for _ in range(2):  # the rule: one more `workers`, one retry, then keep
+                with self.assertRaises(handoff.Refusal) as refused:
+                    handoff.workers_decide(self.ctx, "t2", "close", "no pending use", "the note, Next", False)
+                refusals.append(str(refused.exception))
+                handoff.workers_inspect(self.ctx)
+            self.assertIn("incomplete read", refusals[-1])
+            kept = handoff.workers_decide(self.ctx, "t2", "keep", "close refused: " + refusals[-1], None, False)
+            self.assertEqual(kept["decision"]["outcome"], "recorded")
+            for address in ("t3", "t4", "t5"):
+                handoff.workers_decide(self.ctx, address, "keep", "still active", None, False)
+            self.assertIn("report", handoff.workers_done(self.ctx))
+        self.assertNotIn("kill", calls)
+        self.assertEqual(self.killed, [])
 
     def test_m5_a_restarted_foreground_program_is_not_closed(self):
         self.herdr["t2"] = dict(self.herdr["t2"], foreground={"name": "codex", "pid": 200})
