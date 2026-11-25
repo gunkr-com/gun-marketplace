@@ -98,6 +98,11 @@ function statuslineSource(name, captures, installed) {
 /** Direct account queries are authoritative; session captures remain a fallback. */
 export function accountSource(name, st, captures, installed, now = nowS()) {
   const direct = networkSource(name, st, now);
+  // Antigravity's last successful /usage answer (kept while a later poll fails)
+  // lists every current bucket. Sessions never add one back: a long-lived session
+  // can still emit a retired bucket, such as a separate Argon weekly limit on
+  // accounts where Argon is part of the shared Gemini limit.
+  if (name === "agy" && direct.groups.length) return direct;
   const fallback = statuslineSource(name, captures, installed);
   if (direct.groups.length) {
     let partial = false;
