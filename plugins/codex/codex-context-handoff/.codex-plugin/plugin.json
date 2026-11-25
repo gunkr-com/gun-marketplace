@@ -1,6 +1,6 @@
 {
   "name": "codex-context-handoff",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Continue long Codex CLI tasks in a fresh chat in the same Herdr terminal, with a launcher, per-chat handoff off/on/status, opt-in transfer of an active Goal, bounded recovery of failed switches, Herdr worker messages held for the fresh chat, and a verified restore with a review of the terminal's Herdr workers.",
   "author": {
     "name": "gunkr-com",

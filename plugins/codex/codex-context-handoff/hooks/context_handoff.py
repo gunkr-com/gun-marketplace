@@ -460,8 +460,8 @@ def handoff_request(nonce):
         "so the handoff can run:\n"
         f"HANDOFF READY {nonce}\n"
         "Then write a short Markdown handoff with the goal, user constraints, decisions, "
-        "worktree and branch, changes, validation, next action, and the IDs and state of any "
-        "live Herdr workers. Include only necessary work context. If everything is complete, "
+        "worktree and branch, changes, validation, next action, and for each live Herdr worker its ID, "
+        "state and concrete pending use (or \"no pending use\"). Include only necessary work context. If everything is complete, "
         "the user asked to end, or the remaining work needs the user or an approval, respond "
         "normally and omit the marker."
     )
@@ -471,7 +471,7 @@ def nudge(limit):
     return (
         f"Codex Context Handoff: this chat has passed {limit:g}% of its context window. Do not "
         "abandon the current step. If work will remain after this turn, bring it to a safe "
-        "checkpoint (no half-applied edits; note running workers), avoid starting large new "
+        "checkpoint (no half-applied edits; note each live worker's ID, state and pending use), avoid starting large new "
         "subtasks, and end the turn soon; the Stop hook will then ask for a handoff note and "
         "continue in a fresh chat. If the task is nearly done, finish it normally."
     )
@@ -1647,7 +1647,8 @@ def stop_request_again(record, state):
             "Codex Context Handoff: the Goal was paused for the transfer. Do not call any Goal tool again. Start "
             f"your final answer with this exact plain-text line:\nHANDOFF READY {nonce} GOAL transferred\nThen write "
             "a short Markdown handoff with the goal, user constraints, decisions, worktree and branch, changes, "
-            "validation, next action, and the IDs and state of any live Herdr workers."
+            "validation, next action, and for each live Herdr worker its ID, state and concrete pending use (or "
+            "\"no pending use\")."
         )
     return handoff_request(nonce) + goal_request(record.get("goal"), nonce)
 
@@ -2035,6 +2036,32 @@ SHELL_NOTE = (
     "(HC_TERMINAL_ID, CODEX_THREAD_ID, CODEX_HOME) and find another `codex` on PATH."
 )
 
+# The worker cleanup rule of the restore checklist, the `workers` helper and the reminders (one rule set).
+WORKER_CLEANUP_RULE = (
+    "Keep a worker that is still active (status working, blocked or error, or no status) or that has a concrete "
+    "retention reason: the user pinned it or asked to keep it, it serves a task or attempt that is still active, "
+    "another owner manages it, or its lifecycle is genuinely ambiguous; name that status or reason. Labels that only "
+    "show which tool or run started a worker are not a retention reason by themselves. Reuse a worker only for a "
+    "concrete pending use named in --reason (the result still awaited from it, or the next message this chat will "
+    "send it); \"might be useful\" is not a pending use. Close a done or idle worker only when it has neither a "
+    "concrete pending use nor a retention reason, once its result is captured, with --result naming where it is "
+    "(the worker's result file or location, or the note section that holds it). A retention reason wins over a "
+    "close: a done or idle worker the user pinned, or one still assigned to an active task or attempt, is kept even "
+    "when this chat has no next message for it. A finished worker is closed (recorded as already finished, nothing "
+    "removed) or kept. Do not end a working worker in this cleanup, and never use hc kill, hc rm, kill or any other tool in "
+    "place of the helper. If a close is refused, run `workers` once more and retry once; if it is refused again, "
+    "keep the worker with the refusal as the reason and mention it in your answer. A screen-only snapshot (scope "
+    "screen, partial history) is enough to keep or reuse a worker; a close needs the helper's own complete read. If "
+    "a worker still has no saved evidence after a second `workers`, leave it undecided and report that instead of "
+    "forcing the review."
+)
+WORKER_CLEANUP_SUMMARY = (
+    "keep active workers and any worker with a concrete retention reason, even a done or idle one with no next "
+    "message; reuse only for a concrete pending use; close only a done or idle worker with neither a pending use nor "
+    "a retention reason, after capturing its result, and never with hc kill, hc rm, kill or another tool; a refused "
+    "close is retried once after a fresh `workers`, then kept with the refusal as the reason"
+)
+
 
 def helper_command(*args):
     """The helper command line with this installed plugin's own launcher, by absolute path."""
@@ -2060,9 +2087,10 @@ def restore_checklist(state, secret, transfer):
         + first
         + f"{step}. Read this whole note, including every \"Held worker message\" section the plugin adds "
         "below while the chat switches.\n"
-        f"{step + 1}. Review the Herdr workers started from this terminal: run `{helper_command('workers')}`, "
-        f"read each worker's result, then record a decision for every listed worker with `{decide}` (close only "
-        f"after its result is captured), and finish with `{helper_command('workers', 'done')}`.\n"
+        f"{step + 1}. Clean up the Herdr workers started from this terminal: run `{helper_command('workers')}`, "
+        f"read each worker's result, then record a decision for every listed worker with `{decide}`. "
+        f"{WORKER_CLEANUP_RULE} Finish with `{helper_command('workers', 'done')}`; finished workers keep their "
+        "history in Herdr.\n"
         f"{step + 2}. Confirm with `{helper_command('restored', '--token', '<token>')}`, using the last Read token "
         "line in this note.\n"
         f"\nRead token (revision 0): {read_token(secret, 0)}\n"
@@ -3680,7 +3708,7 @@ def restoration_missing(state):
     unlisted = is_legacy(state) and not state.with_suffix(".workers.json").is_file()
     if (unlisted or manifest_entries(state)) and not state.with_suffix(".workers-report.json").is_file():
         missing.append(f"review the Herdr workers (`{helper_command('workers')}`, then `workers decide` for "
-                       "each and `workers done`)")
+                       f"each and `workers done`: {WORKER_CLEANUP_SUMMARY})")
     missing.append(f"confirm with `{helper_command('restored', '--token', '<the last Read token in the note>')}`")
     return missing
 
@@ -3855,7 +3883,8 @@ def workers_inspect(ctx):
         "new_workers_not_in_review": new, "undecided": undecided,
         "next": ("Read each worker's result (its evidence file and any result location), then run `codex "
                  "context-handoff workers decide <id> keep|reuse|close --reason \"...\"` for every undecided worker "
-                 "(close needs --result <where its result is captured>), then `codex context-handoff workers done`."),
+                 "(close needs --result <where its result is captured>), then `codex context-handoff workers done`. "
+                 + WORKER_CLEANUP_RULE),
     }
 
 

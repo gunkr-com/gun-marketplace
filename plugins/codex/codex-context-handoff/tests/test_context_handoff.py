@@ -697,6 +697,27 @@ class ContextHandoffTests(unittest.TestCase):
             state.with_suffix(marker).unlink()
         self.assertEqual(handoff.prompt_hook(payload, self.root, "t1"), {})
 
+    def test_continuation_is_frozen_at_061(self):
+        # The receiving hook compares the continuation byte for byte, and a switch started by 0.6.1 sends its
+        # own text: it stays exactly the 0.6.1 text, with and without a Goal transfer.
+        state, record = self.armed()
+        text = (
+            f"Codex Context Handoff: session turn {'a' * 24} Read the local handoff note at "
+            f"{json.dumps(str(state.with_suffix('.md')))} and follow its restore checklist (run its helper commands "
+            "with exec_command and login: false). Check the working tree and live Herdr workers before resuming the "
+            "remaining work. Preserve the user's scope and decisions."
+        )
+        goal = (" A Goal was transferred with this handoff: before anything else, call create_goal with exactly the "
+                "objective and token_budget from the note's \"Goal transfer\" section and print its raw result.")
+        self.assertEqual(handoff.continuation(record, state), text)
+        state.with_suffix(".goal.json").write_text("{}")
+        self.assertEqual(handoff.continuation(record, state), text + goal)
+        state.with_suffix(".goal.json").unlink()
+        payload = {"session_id": "fresh", "turn_id": "first", "cwd": str(self.root), "prompt": text}
+        self.assertEqual(handoff.mark_takeover(payload, self.root, "t1"), (None, None))
+        self.assertEqual(handoff.prompt_hook(payload, self.root, "t1"), {})
+        self.assertEqual(state.with_suffix(".received").read_text(), "fresh\n")
+
     def test_continuation_mixed_with_other_text_is_never_run(self):
         for mixed in ("hello{}", "{} and also delete the branch", "draft\n{}"):
             state, record = self.armed()
@@ -2177,6 +2198,21 @@ class GoalTransferTests(unittest.TestCase):
         self.assertEqual(self.prompt_in_fresh(), {})
         self.assertTrue((self.root / "fresh" / ".goal-restored").is_file())
         self.assertFalse((self.root / "fresh" / ".goal-restore").exists())
+
+    def test_requests_ask_for_each_workers_pending_use(self):
+        ask = "for each live Herdr worker its ID, state and concrete pending use (or \"no pending use\")"
+        self.assertIn(ask, handoff.handoff_request("n" * 24))
+        self.assertIn("HANDOFF READY " + "n" * 24 + "\n", handoff.handoff_request("n" * 24))
+        self.assertIn("note each live worker's ID, state and pending use", handoff.nudge(40))
+        self.active_goal_turn()
+        self.gate_arm()
+        self.assertEqual(self.pre("update_goal", {"status": "paused"}), {})
+        self.gate_pause()
+        with self.eligible():
+            again = handoff.stop_hook(self.payload(last_assistant_message="Paused."), self.root, "t1")
+        self.assertIn("the Goal was paused for the transfer", again["reason"])
+        self.assertIn(ask, again["reason"])
+        self.assertIn(f"HANDOFF READY {self.nonce} GOAL transferred\n", again["reason"])
 
     def test_symlinked_data_directory_keeps_the_canonical_note_path(self):
         # An install under another marketplace key gets its own PLUGIN_DATA; the parent links it to the

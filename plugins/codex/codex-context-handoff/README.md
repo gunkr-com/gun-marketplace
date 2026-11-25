@@ -11,7 +11,7 @@ codex plugin marketplace add gunkr-com/gun-marketplace
 codex plugin add codex-context-handoff@gun-marketplace
 ```
 
-Open a new Codex CLI session. Review the plugin's `Stop`, `PreToolUse`, `PostToolUse`, and `UserPromptSubmit` hooks in `/hooks` before trusting them. A plugin update that changes the hooks must be trusted again; 0.4.0 adds `PreToolUse`, and until it is trusted the tool-call gate below does not run. Trust 0.6.1 again after updating.
+Open a new Codex CLI session. Review the plugin's `Stop`, `PreToolUse`, `PostToolUse`, and `UserPromptSubmit` hooks in `/hooks` before trusting them. A plugin update that changes the hooks must be trusted again; 0.4.0 adds `PreToolUse`, and until it is trusted the tool-call gate below does not run. Trust 0.6.2 again after updating.
 
 Install changes as a new plugin version and trust its hooks again. Do not edit the installed copy under `~/.codex/plugins/cache/`: Codex then treats the plugin as changed ("hook approval required") and skips its hooks until they are trusted again, so a handoff can lose its note silently (its `Stop` hook never runs). A chat keeps the hooks it loaded at start; new behavior applies to chats started (or resumed) after the update is installed and trusted.
 
@@ -70,7 +70,7 @@ A prompt of exactly `handoff now` (`핸드오프 지금`) also goes to the model
 
 The hooks act only in an interactive root chat whose hook process descends from the foreground Codex process of the Herdr terminal, in the same worktree. The session source can be `cli`, or `vscode` for a chat first started through the daemon and later resumed with `--no-daemon`. The process check excludes IDE, daemon, `exec`, and subagent hooks.
 
-The handoff includes the task, decisions, worktree, validation, next action, and the terminal's Herdr workers (see "Herdr workers"). The plugin stores its handoff notes and switch logs locally in `$PLUGIN_DATA/<old-session-id>/` (a `.goal.json` beside a note records a transferred Goal). If `$PLUGIN_DATA` is a symlink, the plugin uses the resolved directory, so two installs that share one data directory refer to the same note paths. The notes can contain project context. Review them before sharing. If a Codex update changes its transcript or prompt, the plugin can fall back to manual recovery.
+The handoff includes the task, decisions, worktree, validation, next action, and the terminal's Herdr workers: for each live worker its ID, state and concrete pending use, or "no pending use" (0.6.2; see "Herdr workers"). The plugin stores its handoff notes and switch logs locally in `$PLUGIN_DATA/<old-session-id>/` (a `.goal.json` beside a note records a transferred Goal). If `$PLUGIN_DATA` is a symlink, the plugin uses the resolved directory, so two installs that share one data directory refer to the same note paths. The notes can contain project context. Review them before sharing. If a Codex update changes its transcript or prompt, the plugin can fall back to manual recovery.
 
 ## Long turns (0.5.0)
 
@@ -138,7 +138,7 @@ The note ends with a checklist and a read token that appears only in the note fi
 
 1. A transferred Goal is recreated first with `create_goal`; the helpers below refuse until it is.
 2. Read the whole note, including held worker messages.
-3. Review the workers (below).
+3. Review the workers and clean them up with the worker cleanup rule (below, 0.6.2), then run `codex context-handoff workers done`.
 4. Run `codex context-handoff restored --token <the last Read token in the note>`. A token from before a held message was added is refused, so the fresh chat must read the final note. No message is held after the receipt, so the note is final by then.
 
 The fresh chat's `Stop` hook reminds once if the restore is not confirmed, then reports once. Your own prompt in the fresh chat ends the reminder; a worker message or a `handoff` control does not. `codex context-handoff status` shows the stages, attempts and what is missing.
@@ -174,6 +174,18 @@ The fresh chat reviews them with these helpers, run from a tool call (the launch
 | `codex context-handoff status` | Stages, attempts, held messages and what is missing. |
 
 Workers that keep running are kept and reviewed; the fresh chat does not wait for their results. Finished workers are not removed from Herdr (`hc rm`), so their screens and history stay available; cleanup means ending workers that are no longer needed, not deleting their history.
+
+### Worker cleanup rule (0.6.2)
+
+The restore checklist, the `workers` output and the reminders give the fresh chat one rule for each listed worker. The plugin does not close anything on its own; the chat decides with the helpers above.
+
+- **keep** a worker that is still active (status `working`, `blocked` or `error`, or no status), or one with a concrete retention reason: the user pinned it or asked to keep it, it serves a task or attempt that is still active, another owner manages it, or its lifecycle is genuinely ambiguous. The `--reason` names that status or reason. Labels that only show which tool or run started a worker are not a retention reason by themselves.
+- **reuse** a worker only for a concrete pending use named in `--reason`: the result still awaited from it, or the next message the chat will send it. "Might be useful" is not a pending use.
+- **close** a `done` or `idle` worker only when it has neither a concrete pending use nor a retention reason, after its result is captured (`--result` names the result file or location, or the note section that holds it). A retention reason wins over a close: a done or idle worker the user pinned, or one still assigned to an active task or attempt, is kept even when the chat has no next message for it. A finished worker is closed (recorded as `already-finished`, nothing removed) or kept.
+- The cleanup never ends a working worker, so the checklist does not use `--cancel-working`; ending one stays a separate decision of the user. The chat never uses `hc kill`, `hc rm`, `kill` or another tool in place of the helper. If a close is refused (an incomplete read, a changed status, pid or program, live workers of its own, Herdr unreadable), the chat runs `workers` once more and retries once; if it is refused again, it keeps the worker with the refusal as the reason and says so.
+- A screen-only snapshot (`scope: screen`) is enough to keep or reuse a worker; a close needs the helper's own complete read. A worker with no saved evidence after a second `workers` stays undecided, and `workers done` and `restored` stay refused; the chat reports it instead of forcing the review.
+
+The source chat's handoff note lists each live worker's ID, state and concrete pending use, or "no pending use", so the fresh chat has what the rule needs. The fresh-chat continuation is unchanged from 0.6.1, so a handoff started by 0.6.1 is still received; its note carries the 0.6.1 checklist, while the 0.6.2 reminders and `workers` output state the rule.
 
 ## Recover a handoff
 
